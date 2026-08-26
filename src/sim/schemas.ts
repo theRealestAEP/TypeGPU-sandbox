@@ -125,35 +125,7 @@ export const SMOKE_WORKGROUP = 4;
 
 export const WORKGROUP_SIZE = 64;
 
-/**
- * Floating objects, as clusters of particles in the same buffer as the liquid.
- *
- * They share the neighbour grid and the density constraint, which is the whole
- * trick: the duck cannot be entered by water because it resists compression
- * like any other particle, and water it displaces has to go somewhere. Coupling
- * runs both ways without a line of code that knows what a duck is. A shape
- * match after each solve puts the cluster back into a rigid arrangement, and
- * that is the only thing separating an object from a blob of very thick liquid.
- *
- * They sit past the liquid's own budget rather than taking from it, so adding a
- * duck never costs you water.
- */
-export const BODY_COUNT = 4;
-/**
- * Enough to fill each object solidly at the liquid's own spacing. Sized from the
- * shapes rather than guessed: a duck this big is about 2,100 lattice sites, a
- * hull about 2,400. At 512 every object came out as a quarter-covered shell -
- * torn on screen, and porous to the water it was supposed to displace.
- */
-export const BODY_PARTICLES = QUALITY === 'low' ? 512 : 1024;
-export const BODY_TOTAL = BODY_COUNT * BODY_PARTICLES;
-/** First index in the particle buffer that belongs to an object. */
-export const BODY_START = PARTICLE_COUNT;
-export const TOTAL_PARTICLES = PARTICLE_COUNT + BODY_TOTAL;
-
-export const PARTICLE_WORKGROUPS = Math.ceil(TOTAL_PARTICLES / WORKGROUP_SIZE);
-/** One workgroup per object; each walks its own cluster. */
-export const BODY_STRIDE = Math.ceil(BODY_PARTICLES / WORKGROUP_SIZE);
+export const PARTICLE_WORKGROUPS = Math.ceil(PARTICLE_COUNT / WORKGROUP_SIZE);
 
 /** Solver iterations per step. Three is enough to look incompressible. */
 export const SOLVER_ITERATIONS = 3;
@@ -165,7 +137,7 @@ export const Particle = d.struct({
   vel: d.vec3f,
 });
 
-export const ParticleArray = d.arrayOf(Particle, TOTAL_PARTICLES);
+export const ParticleArray = d.arrayOf(Particle, PARTICLE_COUNT);
 export type ParticleBuffer = TgpuBuffer<typeof ParticleArray> & StorageFlag & VertexFlag;
 
 export const SimParams = d.struct({
@@ -279,32 +251,6 @@ export const LightState = d.struct({
   /** How dominant the key is, 0 to 1. Flat scenes score low and are not trusted. */
   strength: d.f32,
 });
-
-/** Per-object state, rebuilt by the shape match each step. */
-export const BodyState = d.struct({
-  /** Centre of mass, in world space. */
-  centre: d.vec3f,
-  /** Orientation as a quaternion (xyz, w), carried between steps as a seed. */
-  spin: d.vec4f,
-  /**
-   * Fraction of the cluster with liquid around it. Buoyancy is the difference
-   * between how much the object weighs and how much of the liquid it stands in
-   * the way of, so this is the whole of it.
-   */
-  wet: d.f32,
-  /** How heavy the object is compared with the liquid. Under 1 floats. */
-  density: d.f32,
-  /** Non-zero once the object has been placed in the scene. */
-  live: d.u32,
-});
-
-export const BodyStateArray = d.arrayOf(BodyState, BODY_COUNT);
-
-/**
- * Every object particle's place in its own shape. Small and never written after
- * load, so it rides in a uniform binding and leaves a storage slot free.
- */
-export const BodyRestArray = d.arrayOf(d.vec4f, BODY_TOTAL);
 
 /** 3D poly6 normalisation: 315 / (64 pi h^9). */
 export function poly6Coefficient(radius: number): number {

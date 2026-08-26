@@ -1,5 +1,5 @@
 import { d, tgpu } from 'typegpu';
-import { BodyStateArray, Particle, SceneState, SimParams } from './schemas.ts';
+import { Particle, SceneState, SimParams } from './schemas.ts';
 
 /** Everything the position-based-fluid passes touch. */
 export const simLayout = tgpu.bindGroupLayout({
@@ -25,14 +25,6 @@ export const simLayout = tgpu.bindGroupLayout({
   scene: { storage: SceneState, access: 'readonly' },
   /** Particles in the scene, recounted each step. Drives the fill meter. */
   population: { storage: d.arrayOf(d.atomic(d.u32)), access: 'mutable' },
-  /** Per-object state: centre, orientation, how submerged, how heavy. */
-  bodies: { storage: BodyStateArray, access: 'mutable' },
-  /**
-   * Where every object particle belongs relative to its own centre. This is the
-   * shape, and it never changes - the shape match works by asking which rigid
-   * placement of it best explains where the particles drifted to.
-   */
-  bodyRest: { storage: d.arrayOf(d.vec4f), access: 'readonly' },
   fieldSampler: { sampler: 'filtering' },
 });
 

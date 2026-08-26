@@ -8,19 +8,15 @@ import type {
 } from 'typegpu';
 import { createFieldTexture, createSeparableBlur, type SingleChannelTexture } from '../gpu/blur.ts';
 import { createSurfaceFilter } from '../gpu/surface-filter.ts';
-import { FLOATERS } from '../sim/bodies.ts';
 import type { CameraFrame } from '../depth/depth-field.ts';
 import {
-  BODY_COUNT,
   CameraParams,
-  BODY_PARTICLES,
   FieldParams,
   KERNEL_RADIUS,
   PARTICLE_COUNT,
   Particle,
   REST_SPACING,
   SURFACE_RES,
-  TOTAL_PARTICLES,
   Z_MAX,
 } from '../sim/schemas.ts';
 import type { ParticleBuffer } from '../sim/schemas.ts';
@@ -131,8 +127,6 @@ const compositeLayout = tgpu.bindGroupLayout({
   fluid: { texture: d.texture2d(d.f32) },
   /** Unfiltered surface, so the composite can see how broken up it is. */
   rawFluid: { texture: d.texture2d(d.f32) },
-  /** One colour per floating object, indexed by the material channel. */
-  bodyTint: { uniform: d.arrayOf(d.vec4f, BODY_COUNT) },
   thickness: { texture: d.texture2d(d.f32) },
   scene: { texture: d.texture2d(d.f32) },
   /** Ray-marched smoke, premultiplied colour in rgb and coverage in a. */
@@ -149,17 +143,10 @@ const frameLayout = tgpu.bindGroupLayout({
 const cameraSlot = tgpu.slot<boolean>();
 
 const splatVertex = tgpu.vertexFn({
-  in: { pos: d.vec3f, vertex: d.builtin.vertexIndex, instance: d.builtin.instanceIndex },
-  out: { position: d.builtin.position, offset: d.vec2f, centre: d.f32, material: d.f32 },
-})(({ pos, vertex, instance }) => {
+  in: { pos: d.vec3f, vertex: d.builtin.vertexIndex },
+  out: { position: d.builtin.position, offset: d.vec2f, centre: d.f32 },
+})(({ pos, vertex }) => {
   'use gpu';
-  // Which object this particle belongs to, or zero for liquid. Carried through
-  // the splat so the compositor can tell a duck from the water it floats in
-  // without a second pass over the particles.
-  let material = d.f32(0);
-  if (instance >= d.u32(PARTICLE_COUNT)) {
-    material = d.f32(d.u32((instance - d.u32(PARTICLE_COUNT)) / d.u32(BODY_PARTICLES))) + 1;
-  }
   const corner = quadCorners.$[vertex];
   const centre = d.vec3f(pos);
   const radius = splatLayout.$.splat.radius;
@@ -171,7 +158,6 @@ const splatVertex = tgpu.vertexFn({
     position: d.vec4f(point.x * 2 - 1, 1 - point.y * 2, 0.5, 1),
     offset: d.vec2f(corner),
     centre: centre.z,
-    material,
   };
 });
 
@@ -181,9 +167,9 @@ const splatVertex = tgpu.vertexFn({
  * coverage flag so the blur afterwards can average only over covered texels.
  */
 const splatDepthFragment = tgpu.fragmentFn({
-  in: { offset: d.vec2f, centre: d.f32, material: d.f32 },
+  in: { offset: d.vec2f, centre: d.f32 },
   out: { surface: d.vec4f, depth: d.builtin.fragDepth },
-})(({ offset, centre, material }) => {
+})(({ offset, centre }) => {
   'use gpu';
   const radial = std.dot(offset, offset);
   if (radial > 1) {
@@ -192,21 +178,19 @@ const splatDepthFragment = tgpu.fragmentFn({
   const bulge = std.sqrt(std.max(1 - radial, 0)) * splatLayout.$.splat.radius;
   const nearness = centre + bulge;
   return {
-    surface: d.vec4f(nearness, 1, material, 1),
+    surface: d.vec4f(nearness, 1, 0, 1),
     // Larger nearness is closer, so invert it into a normal depth test.
     depth: std.saturate(1 - nearness / d.f32(Z_MAX)),
   };
 });
 
 const splatThicknessFragment = tgpu.fragmentFn({
-  in: { offset: d.vec2f, centre: d.f32, material: d.f32 },
+  in: { offset: d.vec2f, centre: d.f32 },
   out: d.vec4f,
-})(({ offset, material }) => {
+})(({ offset }) => {
   'use gpu';
   const radial = std.dot(offset, offset);
-  // An object is not liquid, so it contributes no optical depth. Letting a duck
-  // add thickness would shade it as very deep water.
-  if (radial > 1 || material > 0.5) {
+  if (radial > 1) {
     std.discard();
   }
   const falloff = 1 - radial;
@@ -273,7 +257,7 @@ const WATER_IOR = 1 / 1.33;
 
 const rawFluidAt = (uv: d.v2f) => {
   'use gpu';
-  return std.textureSample(compositeLayout.$.rawFluid, compositeLayout.$.linear, uv).xyz;
+  return std.textureSample(compositeLayout.$.rawFluid, compositeLayout.$.linear, uv).xy;
 };
 
 /**
@@ -454,30 +438,6 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
   // bending it. They share the liquid's depth buffer, which is what makes a duck
   // half under the surface look half under the surface: the same nearest-wins
   // test decides water-in-front from object-in-front, per texel.
-  const material = raw.z;
-  if (material > 0.5) {
-    const tint = compositeLayout.$.bodyTint[d.u32(std.round(material)) - 1].rgb;
-    // Wrapped rather than clamped: a real object picks up light from the water
-    // and the room as well as from the key, and a bare N-dot-L leaves the shaded
-    // side a dead flat colour.
-    const key = std.dot(normal, look.sun);
-    const lambert = std.saturate(key * 0.5 + 0.5) * 0.7 + 0.3;
-    const sheen = std.pow(std.saturate(std.dot(bounce, look.sun)), 60) * 0.4;
-    const rim = std.pow(1 - facing, 3) * 0.25;
-
-    // Objects stand in the same air the liquid does, so they take the same
-    // distance grading. Skipping it left a duck at the back of the scene
-    // exactly as bright as one at the front, which is most of why they read as
-    // stickers pasted on the picture rather than things in it.
-    const shaded = (tint * lambert + d.vec3f(sheen + rim + glint * 0.3) + torchLit * 1.4) *
-      (0.35 + 0.65 * aerial) *
-      std.mix(d.vec3f(0.85, 0.92, 1.05), d.vec3f(1), aerial);
-
-    // And scene geometry standing in front of them hides them, exactly as it
-    // hides liquid. Without this an object behind the tub wall drew over it.
-    const solid = std.smoothstep(0.25, 0.7, coverage) * (1 - hidden);
-    colour = std.mix(colour, shaded, solid);
-  }
 
   // Smoke sits between the scene and the eye and is already premultiplied, so
   // laying it over is one multiply-add. Its march stopped at the scene surface,
@@ -592,12 +552,6 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
   let look: LiquidLook = { ...defaultLook };
 
   const splatParams = root.createBuffer(SplatParams, { radius: look.splatRadius }).$usage('uniform');
-  const bodyTint = root
-    .createBuffer(
-      d.arrayOf(d.vec4f, BODY_COUNT),
-      FLOATERS.slice(0, BODY_COUNT).map((f) => d.vec4f(f.tint[0], f.tint[1], f.tint[2], 1)),
-    )
-    .$usage('uniform');
   const lookParams = root.createBuffer(LookParams).$usage('uniform');
   const cameraParams = root.createBuffer(CameraParams).$usage('uniform');
 
@@ -627,7 +581,6 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
     look: lookParams,
     fluid: fluid.createView(),
     rawFluid: rawDepth.createView(),
-    bodyTint,
     thickness: thickness.createView(),
     scene: inputs.scene.createView(),
     smoke: inputs.smoke.createView(),
@@ -744,7 +697,7 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
         .with(depthPass)
         .with(splatBindGroup)
         .with(particleLayout, inputs.particles)
-        .draw(VERTS_PER_SPLAT, TOTAL_PARTICLES);
+        .draw(VERTS_PER_SPLAT, PARTICLE_COUNT);
       depthPass.end();
 
       const thicknessPass = encoder.beginRenderPass({
@@ -754,7 +707,7 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
         .with(thicknessPass)
         .with(splatBindGroup)
         .with(particleLayout, inputs.particles)
-        .draw(VERTS_PER_SPLAT, TOTAL_PARTICLES);
+        .draw(VERTS_PER_SPLAT, PARTICLE_COUNT);
       thicknessPass.end();
 
       // Sequential: both blurs share one scratch texture.
@@ -798,7 +751,6 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
 
     destroy() {
       splatParams.destroy();
-      bodyTint.destroy();
       lookParams.destroy();
       cameraParams.destroy();
       rawDepth.destroy();

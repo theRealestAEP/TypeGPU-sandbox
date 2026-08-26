@@ -2,7 +2,6 @@ import { d, std, tgpu } from 'typegpu';
 import type { StorageFlag, TgpuBuffer, TgpuComputePass, TgpuRoot, TgpuSampler } from 'typegpu';
 import type { SingleChannelTexture } from '../gpu/blur.ts';
 import { simLayout } from './bindings.ts';
-import { FLOATERS, BODY_WORKGROUPS, sampleFloater, rigidKernel } from './bodies.ts';
 import { createHashGrid } from './hash-grid.ts';
 import {
   cellCoordOf,
@@ -13,12 +12,6 @@ import {
   spikyGradient,
 } from './sph.ts';
 import {
-  BODY_COUNT,
-  BODY_PARTICLES,
-  BODY_START,
-  BODY_TOTAL,
-  BodyRestArray,
-  BodyStateArray,
   FIELD_RES,
   KERNEL_RADIUS,
   MAX_DEPTH_SCALE,
@@ -31,7 +24,6 @@ import {
   SOLVER_ITERATIONS,
   SceneState,
   SimParams,
-  TOTAL_PARTICLES,
   WORKGROUP_SIZE,
   Z_MAX,
   poly6,
@@ -70,9 +62,6 @@ export const START_FRACTION = 0;
 
 /** Floats per particle: three vec3f, each padded to 16 bytes. */
 const FLOATS_PER_PARTICLE = 12;
-
-/** How hard liquid resists an object moving through it, per second. */
-const BODY_DRAG = 4;
 
 const isDormant = (index: number) => {
   'use gpu';
@@ -255,44 +244,13 @@ const predictKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= TOTAL_PARTICLES) {
+  if (gid.x >= PARTICLE_COUNT) {
     return;
   }
   const params = simLayout.$.params;
   let position = d.vec3f(simLayout.$.particles[gid.x].pos);
   let velocity = d.vec3f(simLayout.$.particles[gid.x].vel);
 
-  // Objects take gravity and buoyancy and nothing else - none of the spout,
-  // draining or recycling below applies to a duck.
-  if (gid.x >= BODY_START) {
-    const body = d.u32((gid.x - d.u32(BODY_START)) / d.u32(BODY_PARTICLES));
-    const state = simLayout.$.bodies[body];
-    if (state.live === 0) {
-      return;
-    }
-    // Archimedes, straight off the definition: weight pulls down by how heavy
-    // the object is, buoyancy pushes back by how much liquid it stands in the
-    // way of. Equilibrium lands at wet == density, so a duck at 0.32 floats
-    // with about a third of itself under, without being told where the surface
-    // is or that a surface exists.
-    const lift = 1 - state.wet / std.max(state.density, 0.02);
-    velocity = velocity + simLayout.$.scene.down * (params.gravity * params.dt * lift);
-    // Liquid resists an object moving through it far more than air does.
-    // Without this the duck pogos on the surface for ever.
-    velocity = velocity * (1 - std.saturate(state.wet * BODY_DRAG * params.dt));
-
-    const bodyReach = std.length(velocity) * params.dt;
-    const bodyLimit = params.kernelRadius * 0.9;
-    if (bodyReach > bodyLimit) {
-      velocity = velocity * (bodyLimit / bodyReach);
-    }
-    simLayout.$.particles[gid.x] = Particle({
-      pos: position + velocity * params.dt,
-      prev: d.vec3f(position),
-      vel: d.vec3f(velocity),
-    });
-    return;
-  }
 
   // At capacity, retire the deepest settled water so the spout never runs dry.
   // Those drops sit at the bottom of the pool under everything else, so removing
@@ -391,7 +349,7 @@ const densityKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= TOTAL_PARTICLES || isDormant(gid.x)) {
+  if (gid.x >= PARTICLE_COUNT || isDormant(gid.x)) {
     return;
   }
   const params = simLayout.$.params;
@@ -442,7 +400,7 @@ const deltaKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= TOTAL_PARTICLES || isDormant(gid.x)) {
+  if (gid.x >= PARTICLE_COUNT || isDormant(gid.x)) {
     return;
   }
   const params = simLayout.$.params;
@@ -489,7 +447,7 @@ const applyKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= TOTAL_PARTICLES || isDormant(gid.x)) {
+  if (gid.x >= PARTICLE_COUNT || isDormant(gid.x)) {
     return;
   }
   const particle = simLayout.$.particles[gid.x];
@@ -516,15 +474,13 @@ const finalizeKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= TOTAL_PARTICLES || isDormant(gid.x)) {
+  if (gid.x >= PARTICLE_COUNT || isDormant(gid.x)) {
     return;
   }
   // Every stage above this one already skips dormant particles, so reaching
   // here is the definition of "in the scene". Counting it costs one atomic on
-  // a thread that is running anyway. Objects are not water and do not count.
-  if (gid.x < PARTICLE_COUNT) {
-    std.atomicAdd(simLayout.$.population[0], 1);
-  }
+  // a thread that is running anyway.
+  std.atomicAdd(simLayout.$.population[0], 1);
   const params = simLayout.$.params;
   const particle = simLayout.$.particles[gid.x];
   let velocity = (particle.pos - particle.prev) / params.dt;
@@ -599,7 +555,7 @@ const viscosityKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= TOTAL_PARTICLES || isDormant(gid.x)) {
+  if (gid.x >= PARTICLE_COUNT || isDormant(gid.x)) {
     return;
   }
   const params = simLayout.$.params;
@@ -642,7 +598,7 @@ const relaxKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= TOTAL_PARTICLES || isDormant(gid.x)) {
+  if (gid.x >= PARTICLE_COUNT || isDormant(gid.x)) {
     return;
   }
   const particle = simLayout.$.particles[gid.x];
@@ -733,8 +689,6 @@ export interface Fluid {
   reset(): void;
   /** Send every particle back to the dormant pool, emptying the scene. */
   drain(): void;
-  /** Re-seed the floating objects at their starting places. */
-  placeBodies(): void;
   destroy(): void;
 }
 
@@ -753,10 +707,10 @@ function initialParticles(
   const layers = Math.max(1, Math.floor((Z_MAX * 0.35) / REST_SPACING));
   const perSlab = columns * layers;
 
-  const bytes = new ArrayBuffer(TOTAL_PARTICLES * FLOATS_PER_PARTICLE * 4);
+  const bytes = new ArrayBuffer(PARTICLE_COUNT * FLOATS_PER_PARTICLE * 4);
   const data = new Float32Array(bytes);
 
-  for (let index = 0; index < TOTAL_PARTICLES; index++) {
+  for (let index = 0; index < PARTICLE_COUNT; index++) {
     const base = index * FLOATS_PER_PARTICLE;
     let x = emitter[0];
     let y = DORMANT_Y;
@@ -795,11 +749,9 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
   let lastObstacleDt = 1 / 30;
 
   const particles = root.createBuffer(ParticleArray).$usage('storage', 'vertex');
-  const deltas = root.createBuffer(d.arrayOf(d.vec4f, TOTAL_PARTICLES)).$usage('storage');
+  const deltas = root.createBuffer(d.arrayOf(d.vec4f, PARTICLE_COUNT)).$usage('storage');
   const params = root.createBuffer(SimParams).$usage('uniform');
   const population = root.createBuffer(d.arrayOf(d.atomic(d.u32), 1)).$usage('storage');
-  const bodies = root.createBuffer(BodyStateArray).$usage('storage');
-  const bodyRest = root.createBuffer(BodyRestArray).$usage('storage');
   const grid = createHashGrid(root, particles);
 
   const bindGroup = root.createBindGroup(simLayout, {
@@ -809,8 +761,6 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
     cellStart: grid.cellStart,
     sortedIndex: grid.sortedIndex,
     population,
-    bodies,
-    bodyRest,
     surface: inputs.surface.createView(),
     surfacePrev: inputs.surfacePrev.createView(),
     surfaceLive: inputs.surfaceLive.createView(),
@@ -826,7 +776,6 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
   const finalize = root.createComputePipeline({ compute: finalizeKernel });
   const viscosity = root.createComputePipeline({ compute: viscosityKernel });
   const relax = root.createComputePipeline({ compute: relaxKernel });
-  const rigid = root.createComputePipeline({ compute: rigidKernel });
 
   const stages = [
     censusReset,
@@ -837,7 +786,6 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
     finalize,
     viscosity,
     relax,
-    rigid,
   ];
 
   function emitterPosition(): [number, number, number] {
@@ -875,50 +823,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
     });
   }
 
-  /**
-   * Drops the objects into the scene, spread across the frame and well in front
-   * of it so they fall in rather than starting inside the geometry.
-   */
-  function placeBodies(): void {
-    const rest = new Float32Array(BODY_TOTAL * 4);
-    const state: {
-      centre: [number, number, number];
-      spin: [number, number, number, number];
-      wet: number;
-      density: number;
-      live: number;
-    }[] = [];
-    const seeded = new Float32Array(TOTAL_PARTICLES * FLOATS_PER_PARTICLE);
-    seeded.set(new Float32Array(initialParticles(emitterPosition(), START_FRACTION)));
-
-    for (let body = 0; body < BODY_COUNT; body++) {
-      const floater = FLOATERS[body % FLOATERS.length];
-      const { points } = sampleFloater(floater);
-      rest.set(points, body * BODY_PARTICLES * 4);
-
-      const centre: [number, number, number] = [
-        0.24 + (body / Math.max(BODY_COUNT - 1, 1)) * 0.52,
-        0.16 + (body % 2) * 0.06,
-        Z_MAX * 0.55,
-      ];
-      state.push({ centre, spin: [0, 0, 0, 1], wet: 0, density: floater.density, live: 1 });
-
-      for (let slot = 0; slot < BODY_PARTICLES; slot++) {
-        const base = (PARTICLE_COUNT + body * BODY_PARTICLES + slot) * FLOATS_PER_PARTICLE;
-        for (let axis = 0; axis < 3; axis++) {
-          const value = centre[axis] + points[slot * 4 + axis];
-          seeded[base + axis] = value;
-          seeded[base + 4 + axis] = value;
-        }
-      }
-    }
-    bodyRest.write(rest);
-    bodies.write(state);
-    particles.write(seeded.buffer);
-  }
-
   particles.write(initialParticles(emitterPosition(), START_FRACTION));
-  placeBodies();
   writeParams();
 
   return {
@@ -943,10 +848,6 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
         density.with(pass).with(bindGroup).dispatchWorkgroups(PARTICLE_WORKGROUPS);
         delta.with(pass).with(bindGroup).dispatchWorkgroups(PARTICLE_WORKGROUPS);
         apply.with(pass).with(bindGroup).dispatchWorkgroups(PARTICLE_WORKGROUPS);
-        // Inside the loop, not after it. The density solve has just pulled the
-        // objects out of floater; if they were only put back at the end, the next
-        // iteration would be solving against a bent duck.
-        rigid.with(pass).with(bindGroup).dispatchWorkgroups(BODY_WORKGROUPS);
       }
 
       finalize.with(pass).with(bindGroup).dispatchWorkgroups(PARTICLE_WORKGROUPS);
@@ -961,15 +862,11 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
 
     reset() {
       particles.write(initialParticles(emitterPosition(), START_FRACTION));
-      placeBodies();
     },
 
     drain() {
       particles.write(initialParticles(emitterPosition(), 0));
-      placeBodies();
     },
-
-    placeBodies,
 
     destroy() {
       grid.destroy();
@@ -977,8 +874,6 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
       deltas.destroy();
       params.destroy();
       population.destroy();
-      bodies.destroy();
-      bodyRest.destroy();
     },
   };
 }

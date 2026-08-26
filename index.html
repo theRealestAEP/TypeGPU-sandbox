@@ -5,52 +5,105 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Liquid in a Cup</title>
     <style>
+      /*
+        The picture is the product; the controls are the console around it.
+        Everything here follows from that. The simulation is square, the window
+        rarely is, so the leftover width becomes the console and the image is
+        never covered. Readouts sit on the image the way a viewfinder's do -
+        no panel, no chrome - and only things you press get a surface.
+      */
       :root {
         color-scheme: dark;
-        --ground: #06080a;
-        --panel: rgba(13, 18, 22, 0.66);
-        --panel-solid: #0d1216;
-        --line: rgba(255, 255, 255, 0.11);
-        --line-strong: rgba(255, 255, 255, 0.22);
-        --ink: #e9eff3;
-        --muted: #78878f;
-        --accent: #56c8f5;
-        --accent-soft: rgba(86, 200, 245, 0.16);
-        --danger: #ff8a7a;
+        --ground: #07090b;
+        --console: #0b0e11;
+        --scrim: rgba(9, 12, 15, 0.84);
+        --edge: rgba(255, 255, 255, 0.09);
+        --edge-lit: rgba(255, 255, 255, 0.2);
+        --text: #f3f1ed;
+        --text-dim: rgba(246, 244, 240, .66);
+        --text-faint: rgba(246, 244, 240, .4);
+        /* Amber, because the water is blue. An instrument's readouts should
+           never be the same colour as the thing it is measuring. */
+        --signal: #f2a65a;
+        --signal-dim: rgba(242, 166, 90, 0.14);
+        --alert: #e2685b;
         --mono: ui-monospace, "SF Mono", Menlo, monospace;
+        --rail: 15.5rem;
+        --gap: 1.1rem;
+        --plate: min(100vh, 100vw);
       }
       * { box-sizing: border-box; }
       html, body { height: 100%; }
       body {
         margin: 0;
         background: var(--ground);
-        color: var(--ink);
-        font: 400 14px/1.5 system-ui, -apple-system, sans-serif;
+        color: var(--text);
+        font: 400 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
         overflow: hidden;
         -webkit-font-smoothing: antialiased;
       }
 
-      /* ---------- stage ---------- */
-      #stage { position: fixed; inset: 0; display: grid; place-items: center; }
+      /* ---------- the plate ---------- */
+      #stage {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        transition: transform .28s cubic-bezier(.4, 0, .2, 1);
+      }
       canvas {
-        width: min(100vw, 100vh);
-        height: min(100vw, 100vh);
+        width: var(--plate);
+        height: var(--plate);
         display: block;
         touch-action: none;
         cursor: crosshair;
       }
-      /* Keeps the HUD legible over a bright scene without dimming the middle. */
+      /* Frame marks. The plate's edge is otherwise invisible against the
+         letterbox, and knowing where the simulation stops is real information. */
+      #stage::before,
+      #stage::after {
+        content: "";
+        position: absolute;
+        width: var(--plate);
+        height: var(--plate);
+        pointer-events: none;
+        --arm: 14px;
+        --thin: 1px;
+      }
+      #stage::before {
+        background:
+          linear-gradient(var(--edge-lit), var(--edge-lit)) 0 0 / var(--arm) var(--thin),
+          linear-gradient(var(--edge-lit), var(--edge-lit)) 0 0 / var(--thin) var(--arm),
+          linear-gradient(var(--edge-lit), var(--edge-lit)) 100% 0 / var(--arm) var(--thin),
+          linear-gradient(var(--edge-lit), var(--edge-lit)) 100% 0 / var(--thin) var(--arm);
+        background-repeat: no-repeat;
+      }
+      #stage::after {
+        background:
+          linear-gradient(var(--edge-lit), var(--edge-lit)) 0 100% / var(--arm) var(--thin),
+          linear-gradient(var(--edge-lit), var(--edge-lit)) 0 100% / var(--thin) var(--arm),
+          linear-gradient(var(--edge-lit), var(--edge-lit)) 100% 100% / var(--arm) var(--thin),
+          linear-gradient(var(--edge-lit), var(--edge-lit)) 100% 100% / var(--thin) var(--arm);
+        background-repeat: no-repeat;
+      }
+      /* Only the top and bottom edges, and only enough to float text off a
+         bright scene. The old version darkened the corners too and made every
+         photo look like it had been shot through a keyhole. */
       #vignette {
         position: fixed;
         inset: 0;
         pointer-events: none;
-        background:
-          linear-gradient(to bottom, rgba(0,0,0,.55), transparent 18%, transparent 72%, rgba(0,0,0,.65)),
-          radial-gradient(120% 90% at 50% 50%, transparent 55%, rgba(0,0,0,.5));
+        background: linear-gradient(
+          to bottom,
+          rgba(0, 0, 0, 0.5),
+          transparent 14%,
+          transparent 78%,
+          rgba(0, 0, 0, 0.55)
+        );
       }
       video { display: none; }
 
-      /* Spout marker: position is where you pour, size is how near to the camera. */
+      /* Spout marker: where you pour, sized by how near the camera it is. */
       #spout {
         position: absolute;
         left: 0;
@@ -58,7 +111,7 @@
         width: 1px;
         height: 1px;
         pointer-events: none;
-        opacity: .5;
+        opacity: .45;
         transition: opacity .15s;
       }
       #spout::before,
@@ -69,274 +122,426 @@
         top: 50%;
         transform: translate(-50%, -50%);
         border-radius: 50%;
-        border: 1px solid var(--accent);
       }
-      #spout::before { width: var(--ring); height: var(--ring); opacity: .55; }
-      #spout::after { width: 5px; height: 5px; background: var(--accent); border: 0; }
+      #spout::before {
+        width: var(--ring);
+        height: var(--ring);
+        border: 1px solid var(--signal);
+        opacity: .5;
+      }
+      #spout::after { width: 4px; height: 4px; background: var(--signal); }
       #spout[data-live="true"] { opacity: 1; }
 
-      /* ---------- hud shell ---------- */
-      .hud { position: fixed; z-index: 2; }
-      .hud-tl { top: clamp(.9rem, 2.2vh, 1.6rem); left: clamp(.9rem, 2.2vw, 1.6rem); }
-      .hud-l {
-        top: 50%;
-        left: clamp(.9rem, 2.2vw, 1.6rem);
-        transform: translateY(-50%);
-        width: 11.5rem;
+      /* ---------- readouts: on the image, never in a box ---------- */
+      .readout {
+        position: fixed;
+        z-index: 2;
+        isolation: isolate;
+        text-shadow: 0 1px 12px rgba(0, 0, 0, .9), 0 0 2px rgba(0, 0, 0, .8);
       }
-      .panel {
-        display: flex;
-        flex-direction: column;
-        gap: .5rem;
-        padding: .7rem;
-        background: var(--panel);
-        backdrop-filter: blur(14px) saturate(1.3);
-        -webkit-backdrop-filter: blur(14px) saturate(1.3);
-        border: 1px solid var(--line);
-        border-radius: 10px;
-        box-shadow: 0 10px 34px -18px #000;
+      .readout::before {
+        content: "";
+        position: absolute;
+        /* Generous box, so the falloff reaches nothing before the box does.
+           A gradient that is still visible at its own edge draws a rectangle,
+           which is exactly the panel this was meant to avoid. */
+        inset: -1.6rem -22rem -12rem -1.6rem;
+        z-index: -1;
+        pointer-events: none;
+        background: radial-gradient(
+          ellipse 118% 118% at 0% 0%,
+          rgba(4, 6, 8, .9) 0%,
+          rgba(4, 6, 8, .62) 34%,
+          rgba(4, 6, 8, .22) 56%,
+          transparent 74%
+        );
       }
-      .panel > h2 {
-        margin: 0 0 .1rem;
-        font-family: var(--mono);
-        font-size: .62rem;
-        letter-spacing: .16em;
-        text-transform: uppercase;
-        color: var(--muted);
-        font-weight: 600;
-      }
-      .scenario {
-        display: flex;
-        flex-direction: column;
-        align-items: flex-start;
-        gap: .12rem;
-        width: 100%;
-        text-align: left;
-        text-transform: none;
-        letter-spacing: 0;
-        font-family: inherit;
-        font-size: .8rem;
-        color: var(--ink);
-        padding: .45rem .55rem;
-      }
-      .scenario small {
-        font-family: var(--mono);
-        font-size: .6rem;
-        letter-spacing: .04em;
-        color: var(--muted);
-        text-transform: uppercase;
-      }
-      .scenario[aria-pressed="true"] small { color: var(--accent); }
-      .hud-tr { top: clamp(.9rem, 2.2vh, 1.6rem); right: clamp(.9rem, 2.2vw, 1.6rem); }
-      .hud-b {
-        bottom: clamp(.9rem, 2.2vh, 1.6rem);
-        left: 50%;
-        transform: translateX(-50%);
-        max-width: calc(100vw - 1.8rem);
-      }
+      .rd-tl { top: var(--gap); left: var(--gap); }
 
       h1 {
         margin: 0;
-        font-size: clamp(1rem, 2.4vh, 1.15rem);
-        font-weight: 700;
-        letter-spacing: .26em;
+        font-size: .95rem;
+        font-weight: 600;
+        letter-spacing: .3em;
         text-transform: uppercase;
       }
-      h1 span { color: var(--accent); }
+      /* Tally lamp. The wordmark's period is the only thing on screen that
+         reports whether liquid is actually leaving the spout. */
+      h1 span { color: var(--text-faint); transition: color .12s, text-shadow .12s; }
+      body[data-pouring="true"] h1 span {
+        color: var(--signal);
+        text-shadow: 0 0 10px var(--signal);
+      }
       #status {
-        margin: .45rem 0 0;
-        font-family: var(--mono);
-        font-size: .72rem;
-        letter-spacing: .02em;
-        color: var(--muted);
-        max-width: 22rem;
+        margin: .5rem 0 0;
+        font-size: .74rem;
+        line-height: 1.5;
+        color: var(--text-dim);
+        max-width: 14.5rem;
         text-wrap: pretty;
       }
-      #status[data-tone="error"] { color: var(--danger); }
+      #status[data-tone="error"] { color: var(--alert); }
+
+      /* ---------- console rails ---------- */
+      .rail {
+        position: fixed;
+        z-index: 2;
+        display: flex;
+        flex-direction: column;
+        gap: .9rem;
+      }
+      .rail-l { left: var(--gap); bottom: var(--gap); width: calc(var(--rail) - var(--gap)); }
+      .rail-r { right: var(--gap); top: var(--gap); align-items: flex-end; }
+
+      .eyebrow {
+        margin: 0 0 .55rem;
+        font-family: var(--mono);
+        font-size: .58rem;
+        letter-spacing: .22em;
+        text-transform: uppercase;
+        color: var(--text-faint);
+        font-weight: 400;
+      }
+
+      /* Solid. Costs the compositor nothing. */
+      .surface {
+        background: var(--console);
+        border: 1px solid var(--edge);
+        border-radius: 3px;
+        box-shadow: inset 0 1px 0 var(--edge-lit), 0 18px 44px -22px rgba(0, 0, 0, .9);
+      }
+      /* The one glass surface, because the bar genuinely sits over the picture.
+         brightness() is what makes it work on arbitrary imagery: it scales
+         whatever is behind it, so white tile is pulled down proportionally
+         while a dark scene stays dark instead of turning to mud. */
+      .glass {
+        background: rgba(6, 9, 11, .55);
+        backdrop-filter: blur(24px) saturate(.6) brightness(.34);
+        -webkit-backdrop-filter: blur(24px) saturate(.6) brightness(.34);
+        border: 1px solid var(--edge);
+        border-radius: 3px;
+        box-shadow: inset 0 1px 0 var(--edge-lit), 0 24px 60px -24px rgba(0, 0, 0, .85);
+      }
+      @supports not (backdrop-filter: blur(1px)) {
+        .glass { background: rgba(9, 12, 15, .9); }
+      }
+
+      /* ---------- scenarios ---------- */
+      #scenarios { display: flex; flex-direction: column; }
+      .scenario {
+        display: block;
+        width: 100%;
+        text-align: left;
+        padding: .5rem .6rem;
+        border: 0;
+        border-left: 2px solid transparent;
+        border-radius: 0;
+        background: transparent;
+        color: var(--text-dim);
+        font: inherit;
+        cursor: pointer;
+        transition: color .12s, background .12s, border-color .12s;
+      }
+      .scenario + .scenario { border-top: 1px solid rgba(255, 255, 255, .05); }
+      .scenario:hover { color: var(--text); background: rgba(255, 255, 255, .04); }
+      .scenario small {
+        display: block;
+        margin-top: .1rem;
+        font-size: .66rem;
+        line-height: 1.35;
+        color: var(--text-faint);
+      }
+      .scenario[aria-pressed="true"] {
+        color: var(--text);
+        border-left-color: var(--signal);
+        background: rgba(255, 255, 255, .05);
+      }
+      .scenario[aria-pressed="true"] small { color: var(--signal); }
 
       /* ---------- controls ---------- */
       .cluster {
         display: flex;
         align-items: center;
-        gap: .28rem;
-        padding: .34rem;
-        background: var(--panel);
-        backdrop-filter: blur(14px) saturate(1.3);
-        -webkit-backdrop-filter: blur(14px) saturate(1.3);
-        border: 1px solid var(--line);
-        border-radius: 10px;
-        box-shadow: 0 10px 34px -18px #000;
+        gap: .15rem;
+        padding: .25rem;
       }
-      .hud-b .cluster { flex-wrap: wrap; justify-content: center; }
+      /* Three groups, spaced not ruled: source, pour, scene. */
+      #pour, #drain { margin-left: .7rem; }
+      .bar {
+        position: fixed;
+        z-index: 2;
+        bottom: var(--gap);
+        left: 50%;
+        transform: translateX(-50%);
+        max-width: calc(100vw - 2 * var(--gap));
+        display: flex;
+        align-items: center;
+        gap: .15rem;
+        padding: .25rem;
+        /* Never wraps. A control bar that reflows into ragged rows reads as an
+           accident; one that scrolls reads as a console too small for the desk. */
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+      .bar::-webkit-scrollbar { display: none; }
 
       button {
         appearance: none;
         font: inherit;
-        font-family: var(--mono);
         font-size: .74rem;
-        letter-spacing: .06em;
-        text-transform: uppercase;
-        color: var(--muted);
+        color: var(--text-dim);
         background: transparent;
         border: 1px solid transparent;
-        border-radius: 6px;
-        padding: .4rem .5rem;
+        border-radius: 3px;
+        padding: .38rem .55rem;
         cursor: pointer;
         display: inline-flex;
         align-items: center;
-        gap: .42rem;
+        gap: .4rem;
         white-space: nowrap;
         transition: color .12s, background .12s, border-color .12s;
       }
-      button:hover { color: var(--ink); background: rgba(255,255,255,.05); }
+      button:hover { color: var(--text); background: rgba(255, 255, 255, .06); }
       button[aria-pressed="true"], button.on {
-        color: var(--accent);
-        background: var(--accent-soft);
-        border-color: rgba(86,200,245,.32);
+        color: var(--signal);
+        background: var(--signal-dim);
       }
-      button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      button:focus-visible { outline: 1px solid var(--signal); outline-offset: 2px; }
+
+      /* The one thing you hold down is the one thing that is filled in. */
+      #pour { color: var(--text); border-color: var(--edge-lit); }
+      #pour[aria-pressed="true"] {
+        color: var(--ground);
+        background: var(--signal);
+        border-color: var(--signal);
+      }
+      /* Emptying the scene is not the same kind of act as changing a view. */
+      #drain:hover { color: var(--alert); background: rgba(226, 104, 91, .1); }
+
       kbd {
         font-family: var(--mono);
-        font-size: .6rem;
+        font-size: .58rem;
         line-height: 1;
-        padding: .2rem .3rem;
-        border: 1px solid var(--line);
-        border-radius: 3px;
-        color: var(--muted);
-        background: rgba(255,255,255,.04);
+        padding: .18rem .28rem;
+        border-radius: 2px;
+        color: var(--text-faint);
+        background: rgba(255, 255, 255, .06);
       }
-      button[aria-pressed="true"] kbd { border-color: rgba(86,200,245,.3); }
+      #pour[aria-pressed="true"] kbd { color: rgba(7, 9, 11, .7); background: rgba(7, 9, 11, .14); }
 
-      .rule { width: 1px; align-self: stretch; background: var(--line); margin: 0 .18rem; }
-
-      /* ---------- fill meter ---------- */
-      .meter {
-        display: flex;
-        align-items: center;
-        gap: .4rem;
-        padding: 0 .35rem 0 .25rem;
-        font-family: var(--mono);
-        font-size: .68rem;
-        letter-spacing: .1em;
-        text-transform: uppercase;
-        color: var(--muted);
+      /* ---------- fill: a level gauge against the plate ----------
+         How full the scene is, is a level. Drawn as one - a column standing
+         beside the picture at the height the liquid has reached - it says the
+         quantity and its own units at once, which a horizontal bar tucked in a
+         toolbar never did. It is also the only element here that could not
+         belong to some other program. */
+      .gauge {
+        position: fixed;
+        z-index: 2;
+        top: 50%;
+        left: calc(50% - var(--plate) / 2 + 1.1rem);
+        height: calc(var(--plate) - 4rem);
+        transform: translateY(-50%);
+        width: 3px;
+        pointer-events: none;
+        text-shadow: 0 1px 8px rgba(0, 0, 0, .95);
       }
       .meter-track {
-        width: clamp(2.8rem, 7vw, 5rem);
-        height: 4px;
-        border-radius: 2px;
-        background: rgba(255,255,255,.1);
-        overflow: hidden;
+        position: absolute;
+        inset: 0;
+        width: 3px;
+        /* Ticks every ten per cent, brighter at the quarters. */
+        background:
+          repeating-linear-gradient(
+            to top,
+            var(--edge-lit) 0 1px,
+            transparent 1px 10%
+          ),
+          rgba(255, 255, 255, .1);
       }
       .meter-fill {
-        display: block;
-        height: 100%;
-        width: 0%;
-        background: var(--accent);
-        transition: width .25s ease-out;
+        position: absolute;
+        left: 0;
+        bottom: 0;
+        width: 100%;
+        height: var(--fill, 0%);
+        background: var(--signal);
+        box-shadow: 0 0 14px -2px var(--signal);
+        transition: height .3s ease-out;
       }
-      .meter b { color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; min-width: 2.6em; }
+      /* The reading rides at the level rather than sitting in a corner. */
+      .gauge b {
+        position: absolute;
+        left: .65rem;
+        bottom: var(--fill, 0%);
+        transform: translateY(50%);
+        font-family: var(--mono);
+        font-size: .68rem;
+        font-weight: 400;
+        color: var(--text);
+        font-variant-numeric: tabular-nums;
+        min-width: 4ch;
+        text-shadow: 0 1px 8px rgba(0, 0, 0, .95);
+        transition: bottom .3s ease-out;
+      }
+      /* Above the column, not below it - the bar owns the bottom edge. */
+      .gauge span.label {
+        position: absolute;
+        top: -1.35rem;
+        left: -.15rem;
+        font-family: var(--mono);
+        font-size: .55rem;
+        letter-spacing: .18em;
+        text-transform: uppercase;
+        color: var(--text-faint);
+      }
 
-      /* ---------- tuning drawer ---------- */
+      /* ---------- tuning ---------- */
       #tune {
         position: fixed;
         z-index: 3;
         top: 0;
         right: 0;
         height: 100%;
-        width: min(20rem, 88vw);
-        padding: 1.1rem 1.1rem 5rem;
-        background: var(--panel-solid);
-        border-left: 1px solid var(--line);
+        width: min(19rem, 90vw);
+        padding: var(--gap) var(--gap) 4rem;
+        background: var(--console);
+        border-left: 1px solid var(--edge);
         overflow-y: auto;
+        overscroll-behavior: contain;
         transform: translateX(100%);
-        transition: transform .22s cubic-bezier(.4, 0, .2, 1);
+        transition: transform .28s cubic-bezier(.4, 0, .2, 1);
         display: flex;
         flex-direction: column;
-        gap: 1.25rem;
+        gap: 1.4rem;
       }
       #tune[data-open="true"] { transform: none; }
+      /* Slide the plate rather than cover it. Hiding the thing you are tuning
+         behind the controls that tune it is the oldest mistake in the book.
+         The console moves with it, and the scenario list stands down - while you
+         are tuning you are not choosing a scene, and it is the only thing wide
+         enough to end up under the picture. */
+      body:has(#tune[data-open="true"]) #stage,
+      body:has(#tune[data-open="true"]) .bar,
+      body:has(#tune[data-open="true"]) .gauge,
+      body:has(#tune[data-open="true"]) .rail-r { --shift: min(9.5rem, 8vw); }
+      body:has(#tune[data-open="true"]) .gauge {
+        transform: translateY(-50%) translateX(calc(-1 * var(--shift)));
+      }
+      body:has(#tune[data-open="true"]) #stage { transform: translateX(calc(-1 * var(--shift))); }
+      body:has(#tune[data-open="true"]) .bar { transform: translateX(calc(-50% - var(--shift))); }
+      body:has(#tune[data-open="true"]) .rail-r { transform: translateX(calc(-1 * min(19rem, 90vw))); }
+      body:has(#tune[data-open="true"]) .rail-l {
+        opacity: 0;
+        pointer-events: none;
+        transform: translateX(-.75rem);
+      }
+      .rail-l, .rail-r, .bar, .gauge { transition: transform .28s cubic-bezier(.4, 0, .2, 1), opacity .2s; }
       #tune header { display: flex; align-items: baseline; justify-content: space-between; }
       #tune h2 {
         margin: 0;
-        font-size: .7rem;
-        letter-spacing: .18em;
-        text-transform: uppercase;
-        color: var(--muted);
-        font-weight: 600;
-      }
-
-      .group { display: flex; flex-direction: column; gap: .65rem; }
-      .group > h3 {
-        margin: 0;
         font-family: var(--mono);
         font-size: .62rem;
-        letter-spacing: .16em;
+        letter-spacing: .22em;
         text-transform: uppercase;
-        color: var(--accent);
-        opacity: .75;
-        padding-bottom: .35rem;
-        border-bottom: 1px solid var(--line);
+        color: var(--text-faint);
+        font-weight: 400;
       }
-      .field { display: flex; flex-direction: column; gap: .3rem; }
+      #tuneBody { display: flex; flex-direction: column; gap: 1.4rem; }
+
+      .group { display: flex; flex-direction: column; gap: .55rem; }
+      .group > h3 {
+        margin: 0 0 .2rem;
+        font-family: var(--mono);
+        font-size: .58rem;
+        letter-spacing: .22em;
+        text-transform: uppercase;
+        color: var(--text-faint);
+        font-weight: 400;
+      }
+      .field { display: flex; flex-direction: column; gap: .25rem; }
       .field-label {
-        display: flex; justify-content: space-between; gap: .6rem;
-        font-family: var(--mono); font-size: .68rem; color: var(--muted);
+        display: flex;
+        justify-content: space-between;
+        gap: .6rem;
+        font-size: .72rem;
+        color: var(--text-dim);
       }
-      .field-label b { color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
-      input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; height: 1.1rem; }
+      .field-label b {
+        color: var(--text);
+        font-family: var(--mono);
+        font-weight: 400;
+        font-size: .68rem;
+        /* Values change every frame; without tabular figures the label dances. */
+        font-variant-numeric: tabular-nums;
+      }
+      input[type="range"] { width: 100%; accent-color: var(--signal); margin: 0; height: 1rem; }
       select {
-        width: 100%; font: inherit; font-size: .78rem;
-        background: #151b20; color: var(--ink);
-        border: 1px solid var(--line); border-radius: 6px; padding: .38rem .5rem;
+        width: 100%;
+        font: inherit;
+        font-size: .74rem;
+        background: #12171b;
+        color: var(--text);
+        border: 1px solid var(--edge);
+        border-radius: 3px;
+        padding: .35rem .45rem;
       }
 
       /* ---------- hint ---------- */
       #hint {
-        position: fixed;
-        z-index: 2;
-        left: 50%;
-        bottom: clamp(4.6rem, 11vh, 6.2rem);
-        transform: translateX(-50%);
-        margin: 0;
-        font-family: var(--mono);
+        margin: .75rem 0 0;
+        max-width: 14.5rem;
         font-size: .7rem;
-        letter-spacing: .08em;
-        color: var(--muted);
-        background: var(--panel);
-        backdrop-filter: blur(10px);
-        -webkit-backdrop-filter: blur(10px);
-        border: 1px solid var(--line);
-        border-radius: 999px;
-        padding: .34rem .8rem;
+        line-height: 1.5;
+        color: var(--text-dim);
         pointer-events: none;
-        opacity: 1;
-        transition: opacity .5s;
-        white-space: nowrap;
+        transition: opacity .6s;
       }
       #hint[data-hidden="true"] { opacity: 0; }
 
-      /* Drop target feedback */
       #stage[data-drop="true"]::after {
         content: "Drop an image or video to use it as the scene";
-        position: absolute;
         inset: 0;
         display: grid;
         place-items: center;
-        font-family: var(--mono);
+        width: auto;
+        height: auto;
+        background: rgba(7, 9, 11, .78);
+        border: 1px solid var(--signal);
         font-size: .8rem;
-        letter-spacing: .08em;
-        color: var(--accent);
-        background: rgba(6, 8, 10, .72);
-        border: 2px dashed var(--accent);
+        color: var(--signal);
         z-index: 4;
       }
 
-      @media (max-width: 40rem) {
-        h1 { font-size: .82rem; letter-spacing: .2em; }
-        #status { font-size: .64rem; max-width: 14rem; }
-        button { padding: .38rem .48rem; font-size: .66rem; }
+      /* Wide enough for a console beside the plate: keep the plate clear of it. */
+      @media (min-width: 62.001rem) {
+        :root { --plate: min(100vh, calc(100vw - var(--rail) - 4rem)); }
+      }
+
+      /* Narrow: the console has nowhere to stand, so it comes back over the
+         image. Scenarios collapse to a strip rather than a column. */
+      @media (max-width: 62rem) {
+        .rail-l {
+          left: var(--gap);
+          right: var(--gap);
+          bottom: calc(var(--gap) + 3.4rem);
+          width: auto;
+        }
         button kbd { display: none; }
+        #scenarios { flex-direction: row; overflow-x: auto; scrollbar-width: none; }
+        #scenarios::-webkit-scrollbar { display: none; }
+        .scenario { width: auto; white-space: nowrap; border-left: 0; border-top: 2px solid transparent; }
+        .scenario + .scenario { border-top: 2px solid transparent; border-left: 1px solid rgba(255,255,255,.05); }
+        .scenario[aria-pressed="true"] { border-left-color: transparent; border-top-color: var(--signal); }
+        .scenario small { display: none; }
+        body:has(#tune[data-open="true"]) #stage { transform: none; }
+        .gauge { display: none; }
+      }
+      @media (max-width: 40rem) {
+        h1 { font-size: .8rem; letter-spacing: .24em; }
+        #status, #hint { font-size: .68rem; max-width: 12rem; }
+        button { padding: .34rem .45rem; font-size: .68rem; }
       }
       @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
     </style>
@@ -347,41 +552,40 @@
     <video playsinline muted></video>
     <input id="picker" type="file" accept="image/*,video/*" hidden />
 
-    <header class="hud hud-tl">
+    <header class="readout rd-tl">
       <h1>Liquid<span>.</span></h1>
       <p id="status">Starting…</p>
+      <p id="hint">Hold to pour. Scroll to set the spout's depth. Drop in an image or video.</p>
     </header>
 
-    <nav class="hud hud-tr"><div class="cluster" id="views"></div></nav>
+    <div class="gauge" aria-hidden="true">
+      <span class="meter-track"></span>
+      <span class="meter-fill" id="meter"></span>
+      <b id="meterValue">0%</b>
+      <span class="label">Fill</span>
+    </div>
 
-    <aside class="hud hud-l">
-      <div class="panel">
-        <h2>Scenarios</h2>
+    <aside class="rail rail-l">
+      <div class="surface">
+        <p class="eyebrow" style="padding:.55rem .6rem 0;margin-bottom:.35rem">Scenarios</p>
         <div id="scenarios"></div>
       </div>
     </aside>
 
-    <div class="hud hud-b">
-      <div class="cluster">
-        <div class="cluster" id="scenes" style="padding:0;border:0;background:none;backdrop-filter:none;box-shadow:none"></div>
-        <button id="open">Open <kbd>O</kbd></button>
-        <div class="rule"></div>
-        <button id="pour" aria-pressed="false">Hold <kbd>space</kbd></button>
-        <button id="storm" aria-pressed="false">Storm <kbd>S</kbd></button>
-        <div class="cluster" id="media" style="padding:0;border:0;background:none;backdrop-filter:none;box-shadow:none"></div>
-        <button id="drain">Drain <kbd>D</kbd></button>
-        <button id="reset">Refill <kbd>R</kbd></button>
-        <div class="rule"></div>
-        <div class="meter">
-          Fill <span class="meter-track"><span class="meter-fill" id="meter"></span></span>
-          <b id="meterValue">0%</b>
-        </div>
-        <div class="rule"></div>
-        <button id="tuneToggle">Tune <kbd>T</kbd></button>
-      </div>
-    </div>
+    <nav class="rail rail-r">
+      <div class="surface cluster" id="views"></div>
+    </nav>
 
-    <p id="hint">Hold to pour &middot; scroll for depth &middot; drop an image or video</p>
+    <div class="bar glass">
+      <div class="cluster" id="scenes" style="padding:0"></div>
+      <button id="open">Open <kbd>O</kbd></button>
+      <button id="pour" aria-pressed="false">Hold <kbd>space</kbd></button>
+      <button id="storm" aria-pressed="false">Storm <kbd>S</kbd></button>
+      <div class="cluster" id="media" style="padding:0"></div>
+      <button id="drain">Drain <kbd>D</kbd></button>
+      <button id="reset">Refill <kbd>R</kbd></button>
+      <button id="tuneToggle">Tune <kbd>T</kbd></button>
+    </div>
 
     <aside id="tune" data-open="false">
       <header><h2>Tuning</h2><button id="tuneClose">Close</button></header>

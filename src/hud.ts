@@ -177,6 +177,7 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
 
   function setPouring(on: boolean): void {
     pouring = on;
+    document.body.dataset.pouring = String(on);
     pourButton.setAttribute('aria-pressed', String(on));
     pourButton.firstChild?.replaceWith(on ? 'Pouring' : 'Hold');
   }
@@ -352,7 +353,10 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
     },
     setFill(fraction) {
       const percent = Math.round(Math.min(Math.max(fraction, 0), 1) * 100);
-      meter.style.width = `${percent}%`;
+      // Drives both the column's height and where the reading rides, so the
+      // number always sits at the level it is reporting.
+      meter.style.setProperty('--fill', `${percent}%`);
+      meterValue.style.setProperty('--fill', `${percent}%`);
       meterValue.textContent = `${percent}%`;
     },
     setSpout(x, y, depth, live) {

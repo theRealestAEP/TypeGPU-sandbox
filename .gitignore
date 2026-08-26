@@ -13,6 +13,9 @@ dist/
 *.log
 npm-debug.log*
 
+# Working notes. Useful locally, not part of the project.
+PLAN.md
+
 # macOS.
 .DS_Store
 
