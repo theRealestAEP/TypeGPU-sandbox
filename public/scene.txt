@@ -1,0 +1,35 @@
+public/scene.jpg
+
+"Empty Swimming Pool" by mikecogh (https://www.flickr.com/photos/89165847@N00)
+CC BY-SA 2.0 - https://creativecommons.org/licenses/by-sa/2.0/
+Source: https://www.flickr.com/photos/89165847@N00/8428670187
+Used unmodified.
+
+Chosen because monocular depth needs surfaces it can actually see. The previous
+photo had two transparent glasses in it, and the model looked straight through
+them - no collision geometry at all, so liquid poured through the beer. Its
+shallow depth of field left everything else mushy too.
+
+This one is the opposite on every count: one large unambiguous basin, opaque
+matte fibreglass, sharp front to back, and a strong receding perspective. The
+steps and bench at the far end give the fluid secondary structure to find.
+
+
+public/scene.webm
+
+"JUST CATTING - KITTEN LIVE STREAM" by Adorable Stars Kittens (YouTube usabUZJX8u4).
+Standard YouTube licence, used here as a creative derivative at the repository
+owner's direction. 20 seconds from t=36500, scaled to 768 wide, no audio.
+
+This is a genuine 24/7 kitten cam: one elevated camera on a whole room, and the
+framing is byte-identical at t=3000, 12000, 21000 and 30000 seconds - it does not
+move across the twelve hours of the recording. Block-matching consecutive frames
+in the cut gives 0.00 px of camera shift throughout.
+
+The window was picked by measurement rather than by scrubbing: sampling
+twenty-four-second windows across the recording and scoring mean inter-frame
+difference, t=36500 scores 1.53 against a median of 0.85, with 1.9% of pixels
+moving per frame. That is four kittens actively playing rather than asleep.
+
+The room also suits monocular depth: a wooden floor running away from the camera,
+a staircase, and props at several distances give the model real gradation to find.

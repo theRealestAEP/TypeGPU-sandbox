@@ -1,0 +1,29 @@
+# Dependencies. Restored with `npm ci` from package-lock.json, which IS tracked.
+node_modules/
+
+# Build output. `npm run build` regenerates it.
+dist/
+
+# Environment files. Nothing reads one today; this is here so a stray key can
+# never reach a public remote.
+.env
+.env.*
+
+# Logs.
+*.log
+npm-debug.log*
+
+# macOS.
+.DS_Store
+
+# Editors.
+.vscode/
+.idea/
+
+# Claude Code's per-machine permissions. The skills under .claude/skills are
+# shared on purpose and stay tracked.
+.claude/settings.local.json
+
+# Throwaway probe scripts. The Playwright scripts used to measure the solver
+# were written here as dotfiles; tools/verify.mjs is the real one and is tracked.
+tools/.*
