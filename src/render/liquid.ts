@@ -119,6 +119,12 @@ const LookParams = d.struct({
   /** Glowing glasses on a tracked face: lens centres, then colour + power. */
   glassesA: d.vec4f,
   glassesB: d.vec4f,
+  /**
+   * Detected drinking vessels, as field-space boxes. Inside one, the scene is
+   * assumed transparent - a glass - so water behind its front face still
+   * renders, which is what lets a held glass visibly fill.
+   */
+  cups: d.arrayOf(d.vec4f, 3),
   debug: d.u32,
 });
 
@@ -432,7 +438,17 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
 
   const alpha = std.smoothstep(look.surfaceLow, look.surfaceHigh, coverage);
   // Real occlusion: scene geometry standing nearer than the liquid hides it.
-  const hidden = std.smoothstep(0, 0.015, sceneZ - fluidZ);
+  let hidden = std.smoothstep(0, 0.015, sceneZ - fluidZ);
+  // Except inside a detected glass, which is transparent to its own contents.
+  for (const slot of std.range(3)) {
+    const cup = look.cups[slot];
+    if (
+      cup.z > cup.x &&
+      uv.x > cup.x && uv.x < cup.z && uv.y > cup.y && uv.y < cup.w
+    ) {
+      hidden *= 0.15;
+    }
+  }
 
   // Optical depth: how much liquid lies along the ray. Deliberately unbounded.
   // Clamping this to one was throwing away every bit of depth the liquid had -
@@ -784,6 +800,7 @@ export interface LiquidLook {
   torchAt: readonly [number, number, number];
   glassesA: readonly [number, number, number, number];
   glassesB: readonly [number, number, number, number];
+  cups: readonly (readonly [number, number, number, number])[];
   /** Planted lamps: xyz position + power, then rgb tint + size. */
   lightsA: readonly (readonly [number, number, number, number])[];
   lightsB: readonly (readonly [number, number, number, number])[];
@@ -816,6 +833,7 @@ export const defaultLook: LiquidLook = {
   torchAt: [0.5, 0.4, Z_MAX * 0.8],
   glassesA: [0.4, 0.4, 0.6, 0.4],
   glassesB: [1, 1, 1, 0],
+  cups: Array.from({ length: 3 }, () => [0, 0, 0, 0] as const),
   lightsA: Array.from({ length: 8 }, () => [0, 0, 0, 0] as const),
   lightsB: Array.from({ length: 8 }, () => [0, 0, 0, 0.1] as const),
   spout: [0.5, 0.1, Z_MAX * 0.92, 0.5],
@@ -1021,6 +1039,7 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
       spout: four(look.spout),
       glassesA: four(look.glassesA),
       glassesB: four(look.glassesB),
+      cups: look.cups.map(four),
       lens: look.lens,
       reflection: look.reflection,
       caustics: look.caustics,

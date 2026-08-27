@@ -1,4 +1,4 @@
-import { FaceLandmarker, FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+import { FaceLandmarker, FilesetResolver, HandLandmarker, ObjectDetector } from '@mediapipe/tasks-vision';
 
 /**
  * Face and hand tracking over the live video, in the field's own coordinates.
@@ -19,6 +19,13 @@ const FACE_MODEL =
   'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 const HAND_MODEL =
   'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const DETECT_MODEL =
+  'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite';
+
+/** COCO classes that mean "a thing you could pour into". */
+const VESSEL_CLASSES = new Set(['cup', 'wine glass', 'bowl', 'vase']);
+/** Runs of the detector are throttled; boxes move slowly compared to hands. */
+const DETECT_EVERY_MS = 160;
 
 /** How the source frame maps into the field; mirrors the depth preprocessor. */
 export interface FrameFit {
@@ -33,7 +40,18 @@ export interface TrackedPoint {
   readonly y: number;
 }
 
+export interface HeldVessel {
+  /** Box in field coordinates. */
+  readonly x0: number;
+  readonly y0: number;
+  readonly x1: number;
+  readonly y1: number;
+  readonly label: string;
+}
+
 export interface Tracked {
+  /** Cups, glasses and bowls the detector currently sees. */
+  readonly vessels: HeldVessel[];
   /** Index fingertip, when a hand is in frame. */
   readonly tip?: TrackedPoint;
   /** Thumb tip, for the pinch gesture. */
@@ -61,7 +79,7 @@ export interface Gestures {
 
 export async function createGestures(): Promise<Gestures> {
   const files = await FilesetResolver.forVisionTasks(WASM_ROOT);
-  const [face, hands] = await Promise.all([
+  const [face, hands, finder] = await Promise.all([
     FaceLandmarker.createFromOptions(files, {
       baseOptions: { modelAssetPath: FACE_MODEL, delegate: 'GPU' },
       runningMode: 'VIDEO',
@@ -74,10 +92,18 @@ export async function createGestures(): Promise<Gestures> {
       runningMode: 'VIDEO',
       numHands: 1,
     }),
+    ObjectDetector.createFromOptions(files, {
+      baseOptions: { modelAssetPath: DETECT_MODEL, delegate: 'GPU' },
+      runningMode: 'VIDEO',
+      scoreThreshold: 0.35,
+      maxResults: 4,
+    }),
   ]);
 
   let lastVideoTime = -1;
-  let held: Tracked = { brow: [], eyes: [], lenses: [], effort: 0 };
+  let lastDetectAt = -1e9;
+  let heldVessels: HeldVessel[] = [];
+  let held: Tracked = { vessels: [], brow: [], eyes: [], lenses: [], effort: 0 };
 
   /** Source-frame normalised coords to field coords: the preprocessor, undone. */
   function toField(
@@ -125,6 +151,54 @@ export async function createGestures(): Promise<Gestures> {
       const faces = face.detectForVideo(video, now);
       const palms = hands.detectForVideo(video, now);
 
+      // The vessel detector runs a few times a second; a held cup moves at
+      // hand speed, and the smoothing below absorbs the gap.
+      if (now - lastDetectAt >= DETECT_EVERY_MS) {
+        lastDetectAt = now;
+        const found = finder.detectForVideo(video, now);
+        const fresh: HeldVessel[] = [];
+        for (const detection of found.detections) {
+          const category = detection.categories[0];
+          const box = detection.boundingBox;
+          if (!category || !box || !VESSEL_CLASSES.has(category.categoryName)) {
+            continue;
+          }
+          const a = toField({ x: box.originX / w, y: box.originY / h }, fit, w, h);
+          const b = toField(
+            { x: (box.originX + box.width) / w, y: (box.originY + box.height) / h },
+            fit,
+            w,
+            h,
+          );
+          fresh.push({
+            x0: Math.min(a.x, b.x),
+            y0: Math.min(a.y, b.y),
+            x1: Math.max(a.x, b.x),
+            y1: Math.max(a.y, b.y),
+            label: category.categoryName,
+          });
+        }
+        // Smooth against the previous set: a box that roughly overlaps its
+        // predecessor eases toward the new detection instead of snapping.
+        heldVessels = fresh.map((next) => {
+          const prior = heldVessels.find(
+            (old) =>
+              Math.abs(old.x0 - next.x0) < 0.15 && Math.abs(old.y0 - next.y0) < 0.15,
+          );
+          if (!prior) {
+            return next;
+          }
+          const ease = 0.55;
+          return {
+            x0: prior.x0 + (next.x0 - prior.x0) * ease,
+            y0: prior.y0 + (next.y0 - prior.y0) * ease,
+            x1: prior.x1 + (next.x1 - prior.x1) * ease,
+            y1: prior.y1 + (next.y1 - prior.y1) * ease,
+            label: next.label,
+          };
+        });
+      }
+
       const map = (p: { x: number; y: number }) => toField(p, fit, w, h);
       let tip: TrackedPoint | undefined;
       let thumb: TrackedPoint | undefined;
@@ -162,13 +236,14 @@ export async function createGestures(): Promise<Gestures> {
         }
       }
 
-      held = { tip, thumb, brow, eyes, lenses, effort };
+      held = { vessels: heldVessels, tip, thumb, brow, eyes, lenses, effort };
       return held;
     },
 
     destroy() {
       face.close();
       hands.close();
+      finder.close();
     },
   };
 }

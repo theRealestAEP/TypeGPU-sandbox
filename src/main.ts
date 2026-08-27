@@ -392,7 +392,7 @@ async function main(): Promise<void> {
   /** Face and hand tracking, loaded the first time a video scene opens. */
   let gestures: Gestures | undefined;
   let gesturesLoading = false;
-  let tracked: Tracked = { brow: [], eyes: [], lenses: [], effort: 0 };
+  let tracked: Tracked = { vessels: [], brow: [], eyes: [], lenses: [], effort: 0 };
   /** Fingertip control of the active tool; the toggle beside the readouts. */
   let handControl = true;
   /** Light-up glasses: brightness slider; the colour cycles on its own. */
@@ -1577,6 +1577,20 @@ async function main(): Promise<void> {
       fingerPour = pinched;
       applyFlow();
     }
+
+    // Detected cups reach the renderer, and the auto-aim spawn does the rest:
+    // pour over a held glass and the water spawns just in front of it. The
+    // collision carve that gives the glass a real interior lands once the
+    // boundary work in flight settles; until then the visual transparency and
+    // the spawn aim are already live.
+    const cupBoxes: [number, number, number, number][] = [];
+    for (const vessel of tracked.vessels.slice(0, 3)) {
+      cupBoxes.push([vessel.x0, vessel.y0, vessel.x1, vessel.y1]);
+    }
+    while (cupBoxes.length < 3) {
+      cupBoxes.push([0, 0, 0, 0]);
+    }
+    renderer.look({ cups: cupBoxes });
 
     // Light-up glasses ride the irises, colour wheeling on its own.
     if (glassesGlow > 0 && tracked.lenses.length === 2) {
