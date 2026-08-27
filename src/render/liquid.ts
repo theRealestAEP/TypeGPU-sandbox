@@ -666,6 +666,20 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
   // half under the surface look half under the surface: the same nearest-wins
   // test decides water-in-front from object-in-front, per texel.
 
+  // A whisper of an outline on every detected vessel, so whether the detector
+  // fired is never a mystery during a live test.
+  for (const slot of std.range(3)) {
+    const cup = look.cups[slot];
+    if (cup.z > cup.x) {
+      const inX = std.min(uv.x - cup.x, cup.z - uv.x);
+      const inY = std.min(uv.y - cup.y, cup.w - uv.y);
+      const inset = std.min(inX, inY);
+      if (inset > 0 && inset < 0.004) {
+        colour = std.mix(colour, d.vec3f(0.55, 0.85, 1.0), 0.35);
+      }
+    }
+  }
+
   // The glasses themselves: two glowing rings and a bridge, drawn on the face
   // before the smoke composites, so what stands in front still covers them.
   if (look.glassesB.w > 0.001) {
