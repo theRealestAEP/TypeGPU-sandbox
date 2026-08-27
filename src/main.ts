@@ -498,7 +498,7 @@ async function main(): Promise<void> {
     // scene's tilt - the webcam was opening with the city's steep pitch.
     gravityManual = false;
     field.tune({ manual: false });
-    field.scene.write({ down: [0, 1, 0], drift: 0 });
+    field.scene.write({ down: [0, 1, 0], drift: 0, groundShare: 0, groundTight: 0 });
     // An active pour re-arms its medium; without this a scenario that resets
     // and then pours smoke had its smoke switched off by its own reset.
     applyFlow();

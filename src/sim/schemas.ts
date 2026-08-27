@@ -257,6 +257,10 @@ export const SceneState = d.struct({
   down: d.vec3f,
   /** Mean forward advance of the whole surface since the last depth update. */
   drift: d.f32,
+  /** Fraction of the frame whose normals lean up-image - candidate ground. */
+  groundShare: d.f32,
+  /** Mean resultant length of those normals - how much they agree. */
+  groundTight: d.f32,
 });
 
 /** How a camera frame is cropped and turned to line up with the field. */

@@ -339,8 +339,12 @@ const orientKernel = tgpu.computeFn({
     // ground is not merely present, it is COHERENT - every floor texel's
     // normal points the same way, while a face's scatter over a hemisphere.
     // The prior is a level camera, and only abundant, agreeing ground moves it.
+    // The coherence knee sits at 0.78, measured, not guessed: a straight-on
+    // room shot's phantom ground - fern, shoulders, door frame - musters 0.77
+    // at best, while real floors (tub 0.86, stove 0.82) sit clear above. Below
+    // the knee the scene has no floor worth believing and the prior holds.
     const confidence = std.saturate((groundShare.$ - 0.05) / 0.1) *
-      std.saturate((groundTight.$ - 0.7) / 0.2);
+      std.saturate((groundTight.$ - 0.78) / 0.1);
     down = std.normalize(std.mix(d.vec3f(0, 1, 0), down, confidence));
 
     // The source's own prior caps the pitch outright. Three rounds of ever
@@ -385,6 +389,8 @@ const orientKernel = tgpu.computeFn({
     }
     orientLayout.$.scene.down = d.vec3f(down);
     orientLayout.$.scene.drift = driftShared.$;
+    orientLayout.$.scene.groundShare = groundShare.$;
+    orientLayout.$.scene.groundTight = groundTight.$;
   }
 });
 
@@ -459,7 +465,7 @@ export function createSurfaceField(
     })
     .$usage('uniform');
   const scene = root
-    .createBuffer(SceneState, { down: d.vec3f(0, 1, 0), drift: 0 })
+    .createBuffer(SceneState, { down: d.vec3f(0, 1, 0), drift: 0, groundShare: 0, groundTight: 0 })
     .$usage('storage');
   const scratch = createFieldTexture(root, FIELD_RES);
   const surface = createFieldTexture(root, FIELD_RES);
