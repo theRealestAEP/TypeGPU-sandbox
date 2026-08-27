@@ -34,6 +34,13 @@ export const simLayout = tgpu.bindGroupLayout({
    * live, and deltas.w is overwritten by the solver each iteration.
    */
   calms: { storage: d.arrayOf(d.f32), access: 'mutable' },
+  /**
+   * Surface push applied to each particle this step, summed across the solver
+   * iterations. Finalize subtracts it from the position delta before deriving
+   * velocity, so collision repair moves water without throwing it. This is the
+   * eighth storage buffer of the eight the device guarantees per stage.
+   */
+  boundary: { storage: d.arrayOf(d.vec3f), access: 'mutable' },
   fieldSampler: { sampler: 'filtering' },
 });
 

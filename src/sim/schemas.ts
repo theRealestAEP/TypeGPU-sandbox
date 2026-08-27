@@ -73,6 +73,21 @@ export const KERNEL_RADIUS = CELL_SIZE;
 export const Z_MAX = GRID_Z * CELL_SIZE;
 
 /**
+ * Depth change at one texel between consecutive depth updates past which the
+ * change is a topology flip - an occluder arriving or leaving - rather than a
+ * surface in motion. It matches the collision slab's thickness (surfaceShell,
+ * twelve kernel radii): a surface cannot move further than its own slab in
+ * one depth interval, so a bigger jump means the texel changed owners, and
+ * walking a wall between the two owners only sweeps phantom motion through
+ * the water column. Set lower it misfires on the monocular depth model's
+ * global renormalisation - a hand entering the frame shifts the measured
+ * depth of the whole sink, and snapping that jump teleports the floor under
+ * the settled pool. In normalised depth units; multiply by depthScale before
+ * comparing scaled samples.
+ */
+export const TOPOLOGY_SNAP = KERNEL_RADIUS * 12;
+
+/**
  * Rest spacing. At 2.2 particles per kernel radius a particle sees roughly 45
  * neighbours, the usual sweet spot in 3D.
  */

@@ -23,6 +23,7 @@ import {
   SOLVER_ITERATIONS,
   SceneState,
   SimParams,
+  TOPOLOGY_SNAP,
   WORKGROUP_SIZE,
   Z_MAX,
   poly6,
@@ -132,7 +133,7 @@ const surfaceNormal = (image: d.v2f) => {
   return std.normalize(d.vec3f(surfaceSlope(image) * -1, 1));
 };
 
-const resolveSurface = (from: d.v3f, position: d.v3f) => {
+const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
   'use gpu';
   const params = simLayout.$.params;
   let resolved = d.vec3f(position);
@@ -210,9 +211,24 @@ const resolveSurface = (from: d.v3f, position: d.v3f) => {
   // pour's impact or a paw, and that still gets parked out front.
   const buried = -gap;
   const behind = buried > params.surfaceShell;
-  const stayedBehind = behind && from.z - surfaceAt(from.xy) < -params.surfaceShell;
+  // A texel a transient occluder covers reads far in front of the remembered
+  // scene. The water beneath never walked into anything - the surface flipped
+  // in front of it when the occluder arrived - so the occluder is visual-only
+  // for it: it belongs to the space behind the live surface and collides
+  // against the remembered background instead. The margin on the from test
+  // matters at the top: water genuinely caught ON an occluder - the pour
+  // landing on a hand - jitters a little either side of the surface as it
+  // rests, and without the two-radii allowance every dip routed it to the
+  // background and it dripped through the hand. Water without an occluder
+  // over it belongs behind only if it was already past the slab when the step
+  // started; arriving there within one step means it was pressed through, by
+  // a pour's impact, and still gets parked out front.
+  const occluded = surface - surfaceBackAt(resolved.xy) > params.surfaceShell;
+  const belongsBehind =
+    (occluded && from.z - surface < -params.kernelRadius * 2) ||
+    (behind && from.z - surfaceAt(from.xy) < -params.surfaceShell);
 
-  if (surface > playZ && gap < 0 && !stayedBehind) {
+  if (surface > playZ && gap < 0 && !belongsBehind) {
     const normal = surfaceNormal(resolved.xy);
     // Push out by exactly how far in the particle is, and no further.
     //
@@ -220,26 +236,38 @@ const resolveSurface = (from: d.v3f, position: d.v3f) => {
     // liquid: a paw coming down puts water inside the surface by however far it
     // advanced, and shoving it back out by that much is the push. It is also
     // self-limiting - once the particle is clear, the gap is positive and this
-    // does nothing.
+    // does nothing. The push normally DOES read back as velocity in finalize:
+    // that is how resting water tracks a surface that jitters under it.
+    // Subtracting it everywhere was tried and made settled pools simmer
+    // harder - lifted with no velocity, every downward flicker of the floor
+    // became a small free fall and a slap.
     //
-    // Adding the surface's own advance on top of it is not. That advance spans
-    // one depth update, but this runs once per solver iteration - three times a
-    // step, 120 steps a second, against roughly 30 depth updates a second - so
-    // a paw's motion was applied about twelve times over, and every cat that
-    // moved threw the whole pool. Measured on the clip: 14% of the body above
-    // 0.3 units/s and a 99th percentile at the velocity cap, against 0.3% on a
-    // still photo. The obstacle's speed still caps how fast water may leave the
-    // contact, in finalizeKernel; it just no longer injects anything.
+    // The exception is a texel whose depth jumped past the topology threshold
+    // this update: that texel changed owners - a hand arrived in front of the
+    // sink - and the walk sweeping the wall between the two owners is not
+    // motion water should inherit. Those pushes are recorded in `boundary`
+    // and finalize subtracts them, so a passing occluder shoves nothing.
     const escape = std.min(buried, params.pushLimit);
-    resolved = resolved + normal * escape;
+    const pushed = normal * escape;
+    resolved = resolved + pushed;
+    const jump = std.abs(surfaceNowAt(resolved.xy) - surfacePrevAt(resolved.xy));
+    if (jump > TOPOLOGY_SNAP * params.depthScale) {
+      simLayout.$.boundary[index] = simLayout.$.boundary[index] + pushed;
+    }
 
     // Buried far deeper than one shell - under a pour's impact point or a paw -
     // a capped escape crawls out over many frames, dragging neighbours with it
     // and churning everything nearby. Snap to just in front of the surface in
     // one move instead: invisible next to the impact that buried it, and the
     // solver stops paying for the crawl.
+    //
+    // The snap is a teleport, and a teleport must not become kinetic energy:
+    // it is recorded in `boundary` and finalize subtracts it before deriving
+    // velocity, so the rescue relocates the particle without throwing it.
     if (behind) {
-      resolved = d.vec3f(resolved.xy, surface + params.kernelRadius * 0.5);
+      const snapped = d.vec3f(resolved.xy, surface + params.kernelRadius * 0.5);
+      simLayout.$.boundary[index] = simLayout.$.boundary[index] + (snapped - resolved);
+      resolved = d.vec3f(snapped);
     }
   }
 
@@ -248,7 +276,7 @@ const resolveSurface = (from: d.v3f, position: d.v3f) => {
   // fell through - the whole pool scattering whenever a hand passed over. The
   // background layer remembers what the occluder covered, and water behind the
   // live surface supports against the scene that is still really there.
-  if (stayedBehind) {
+  if (belongsBehind) {
     const back = surfaceBackAt(resolved.xy);
     const backGap = resolved.z - back;
     if (back > playZ && backGap < 0) {
@@ -285,6 +313,8 @@ const predictKernel = tgpu.computeFn({
     return;
   }
   const params = simLayout.$.params;
+  // A fresh step owes no boundary repair yet.
+  simLayout.$.boundary[gid.x] = d.vec3f();
   let position = d.vec3f(simLayout.$.particles[gid.x].pos);
   let velocity = d.vec3f(simLayout.$.particles[gid.x].vel);
 
@@ -503,7 +533,7 @@ const applyKernel = tgpu.computeFn({
     // fast drop can already be through a rim by the time the solver first sees
     // it; `prev` is the last position known to be on the legal side of every
     // wall.
-    pos: resolveSurface(particle.prev, particle.pos + simLayout.$.deltas[gid.x].xyz),
+    pos: resolveSurface(gid.x, particle.prev, particle.pos + simLayout.$.deltas[gid.x].xyz),
     prev: d.vec3f(particle.prev),
     vel: d.vec3f(particle.vel),
   });
@@ -529,7 +559,12 @@ const finalizeKernel = tgpu.computeFn({
   std.atomicAdd(simLayout.$.population[0], 1);
   const params = simLayout.$.params;
   const particle = simLayout.$.particles[gid.x];
-  let velocity = (particle.pos - particle.prev) / params.dt;
+  // `boundary` holds the step's zero-impulse repairs - deep-burial snaps, and
+  // push-outs at texels whose depth jumped past the topology threshold.
+  // Subtracting them here means those relocations never read back as kinetic
+  // energy. Ordinary push-outs on stable texels are NOT in the buffer - their
+  // read-back is how resting water tracks a surface that jitters under it.
+  let velocity = (particle.pos - particle.prev - simLayout.$.boundary[gid.x]) / params.dt;
 
   // A large solver correction reads back as a large velocity. Cap it at the same
   // step the predictor allows, so one bad frame cannot inject energy that takes
@@ -561,21 +596,24 @@ const finalizeKernel = tgpu.computeFn({
   ) {
     const normal = surfaceNormal(particle.pos.xy);
     // How fast the surface here is advancing, phantom motion already removed.
-    const sweepRate =
-      std.min(
-        std.max(
-          surfaceNowAt(particle.pos.xy) - surfacePrevAt(particle.pos.xy) - simLayout.$.scene.drift,
-          0,
-        ) / std.max(params.obstacleDt, 0.001),
-        (params.kernelRadius * 0.9) / params.dt,
-      );
+    const advance = surfaceNowAt(particle.pos.xy) - surfacePrevAt(particle.pos.xy);
+    let sweepRate = std.min(
+      std.max(advance - simLayout.$.scene.drift, 0) / std.max(params.obstacleDt, 0.001),
+      (params.kernelRadius * 0.9) / params.dt,
+    );
+    // A jump past the topology threshold is a texel changing owners - a hand
+    // arriving in front of the sink - not a surface in motion. No obstacle
+    // velocity may be derived from it.
+    if (std.abs(advance) > TOPOLOGY_SNAP * params.depthScale) {
+      sweepRate = 0;
+    }
     const outward = std.dot(velocity, normal);
-    // Water may leave a contact no faster than the surface itself is advancing,
-    // plus a small allowance for genuine splash. The push-out acts positionally
-    // along this same normal, so every solver correction lands next step as
-    // outward velocity; uncapped, that loop compounds frame on frame and the
-    // pool boils. Removing both the into-surface press and the excess above the
-    // obstacle's own speed keeps the shove without the pump.
+    // Water may leave a contact no faster than the surface itself is
+    // advancing, plus a small allowance for genuine splash. The push-out acts
+    // positionally along this same normal, so every solver correction lands
+    // next step as outward velocity; uncapped, that loop compounds frame on
+    // frame and the pool boils. Removing both the into-surface press and the
+    // excess above the obstacle's own speed keeps the shove without the pump.
     const allowed = sweepRate + params.kernelRadius * 2;
     const removed = std.min(outward, 0) + std.max(outward - allowed, 0);
     velocity = velocity - normal * removed;
@@ -896,6 +934,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
   const params = root.createBuffer(SimParams).$usage('uniform');
   const population = root.createBuffer(d.arrayOf(d.atomic(d.u32), 1)).$usage('storage');
   const calms = root.createBuffer(d.arrayOf(d.f32, PARTICLE_COUNT)).$usage('storage');
+  const boundary = root.createBuffer(d.arrayOf(d.vec3f, PARTICLE_COUNT)).$usage('storage');
   const grid = createHashGrid(root, particles);
 
   const bindGroup = root.createBindGroup(simLayout, {
@@ -906,6 +945,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
     sortedIndex: grid.sortedIndex,
     population,
     calms,
+    boundary,
     surface: inputs.surface.createView(),
     surfacePrev: inputs.surfacePrev.createView(),
     surfaceLive: inputs.surfaceLive.createView(),
@@ -1017,6 +1057,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
       params.destroy();
       population.destroy();
       calms.destroy();
+      boundary.destroy();
     },
   };
 }
