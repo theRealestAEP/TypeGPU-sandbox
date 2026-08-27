@@ -218,6 +218,15 @@ export const SimParams = d.struct({
   /** How deep below the surface counts as settled, for recycling. */
   recycleBand: d.f32,
   frame: d.u32,
+  /**
+   * Detected drinking vessels, as field-space boxes; empty slots have x1 <= x0.
+   * The carve gives a glass an interior but takes its transparent near wall
+   * with it, and a heightfield has no way to put it back - one depth per
+   * texel. These boxes let the solver re-add that wall analytically.
+   */
+  cups: d.arrayOf(d.vec4f, 3),
+  /** Per cup, the vessel's front depth (raw 0..1); w is unused. */
+  cupFronts: d.vec4f,
 });
 
 export const FieldParams = d.struct({

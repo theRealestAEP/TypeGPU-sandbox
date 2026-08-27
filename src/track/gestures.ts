@@ -93,7 +93,11 @@ export async function createGestures(): Promise<Gestures> {
       numHands: 1,
     }),
     ObjectDetector.createFromOptions(files, {
-      baseOptions: { modelAssetPath: DETECT_MODEL, delegate: 'GPU' },
+      // CPU on purpose: with three tasks sharing one context, the GPU-delegate
+      // detector returned the same hallucination for every frame - it never
+      // saw the video at all. Lite0-int8 is built for CPU and runs in tens of
+      // milliseconds at the 6Hz this needs.
+      baseOptions: { modelAssetPath: DETECT_MODEL, delegate: 'CPU' },
       runningMode: 'VIDEO',
       scoreThreshold: 0.35,
       maxResults: 4,

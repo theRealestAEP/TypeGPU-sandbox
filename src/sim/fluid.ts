@@ -559,12 +559,41 @@ const finalizeKernel = tgpu.computeFn({
   std.atomicAdd(simLayout.$.population[0], 1);
   const params = simLayout.$.params;
   const particle = simLayout.$.particles[gid.x];
+  let position = d.vec3f(particle.pos);
+
+  // The glass's near wall, restored. The carve digs a cavity by pushing the
+  // surface back, which also deletes the vessel's transparent front face - and
+  // under a level camera gravity has no into-scene component, so pool pressure
+  // squeezes settled water out toward the viewer, where it free-falls off the
+  // glass. Measured: 70% of a full glass drained within four seconds of the
+  // pour stopping. So inside each cup box, over carved texels only, water that
+  // was behind the vessel's front plane stays behind it: a one-way wall, using
+  // the previous position so water already in front of the glass is left alone.
+  for (const slot of std.range(3)) {
+    const cup = params.cups[slot];
+    if (cup.z <= cup.x) {
+      continue;
+    }
+    const wall = params.cupFronts[slot] * params.depthScale - params.kernelRadius * 0.5;
+    if (
+      position.x > cup.x &&
+      position.x < cup.z &&
+      position.y > cup.y &&
+      position.y < cup.w &&
+      position.z > wall &&
+      particle.prev.z < wall &&
+      surfaceAt(position.xy) < wall - params.kernelRadius
+    ) {
+      position = d.vec3f(position.xy, wall);
+    }
+  }
+
   // `boundary` holds the step's zero-impulse repairs - deep-burial snaps, and
   // push-outs at texels whose depth jumped past the topology threshold.
   // Subtracting them here means those relocations never read back as kinetic
   // energy. Ordinary push-outs on stable texels are NOT in the buffer - their
   // read-back is how resting water tracks a surface that jitters under it.
-  let velocity = (particle.pos - particle.prev - simLayout.$.boundary[gid.x]) / params.dt;
+  let velocity = (position - particle.prev - simLayout.$.boundary[gid.x]) / params.dt;
 
   // A large solver correction reads back as a large velocity. Cap it at the same
   // step the predictor allows, so one bad frame cannot inject energy that takes
@@ -589,14 +618,14 @@ const finalizeKernel = tgpu.computeFn({
   // clamp meant to hold them, and they kept the full push as speed. That is
   // what made a moving cat throw the pool.
   const contact = particle.prev.z - surfaceAt(particle.prev.xy);
-  const gap = particle.pos.z - surfaceAt(particle.pos.xy);
+  const gap = position.z - surfaceAt(position.xy);
   if (
     std.min(contact, gap) < params.kernelRadius * 0.35 &&
     std.max(contact, gap) > -params.surfaceShell
   ) {
-    const normal = surfaceNormal(particle.pos.xy);
+    const normal = surfaceNormal(position.xy);
     // How fast the surface here is advancing, phantom motion already removed.
-    const advance = surfaceNowAt(particle.pos.xy) - surfacePrevAt(particle.pos.xy);
+    const advance = surfaceNowAt(position.xy) - surfacePrevAt(position.xy);
     let sweepRate = std.min(
       std.max(advance - simLayout.$.scene.drift, 0) / std.max(params.obstacleDt, 0.001),
       (params.kernelRadius * 0.9) / params.dt,
@@ -628,7 +657,7 @@ const finalizeKernel = tgpu.computeFn({
   }
 
   simLayout.$.particles[gid.x] = Particle({
-    pos: d.vec3f(particle.pos),
+    pos: d.vec3f(position),
     prev: d.vec3f(particle.prev),
     vel: d.vec3f(velocity),
   });
@@ -838,6 +867,8 @@ export interface FluidTuning {
   emitterX: number;
   emitterY: number;
   emitterZ: number;
+  /** Detected vessels: field-space box plus front depth. At most three. */
+  cups: readonly { box: readonly [number, number, number, number]; front: number }[];
 }
 
 export const defaultTuning: FluidTuning = {
@@ -863,6 +894,7 @@ export const defaultTuning: FluidTuning = {
   emitterX: 0.5,
   emitterY: 0.06,
   emitterZ: Z_MAX * 0.92,
+  cups: [],
 };
 
 export interface Fluid {
@@ -1006,6 +1038,16 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
       recycle: tuning.recycle ? 1 : 0,
       recycleBand: KERNEL_RADIUS * 5,
       frame,
+      cups: [0, 1, 2].map((i): [number, number, number, number] => {
+        const cup = tuning.cups[i];
+        return cup ? [cup.box[0], cup.box[1], cup.box[2], cup.box[3]] : [0, 0, 0, 0];
+      }),
+      cupFronts: [
+        tuning.cups[0]?.front ?? 0,
+        tuning.cups[1]?.front ?? 0,
+        tuning.cups[2]?.front ?? 0,
+        0,
+      ],
     });
   }
 

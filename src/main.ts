@@ -1,4 +1,7 @@
 import { d, tgpu } from 'typegpu';
+
+/** Injected by vite: the git commit this page was built from. */
+declare const __BUILD__: string;
 import { ROTATIONS, createCameraSession, detectRotation, rotationGeometry } from './camera.ts';
 import type { Rotation } from './camera.ts';
 import type { CameraFrame, DepthSource } from './depth/depth-field.ts';
@@ -1540,6 +1543,7 @@ async function main(): Promise<void> {
    * the face, so it rolls down the real geometry.
    */
   /** Cups flow to the renderer and the carver whatever scene is up. */
+  let latestCups: { box: readonly [number, number, number, number]; front: number }[] = [];
   function driveCups(): void {
     // Detected cups reach the renderer, and the auto-aim spawn does the rest:
     // pour over a held glass and the water spawns just in front of it. The
@@ -1556,30 +1560,48 @@ async function main(): Promise<void> {
     renderer.look({ cups: cupBoxes });
 
     // The carve needs each vessel's front depth; the probe's downsample is the
-    // cheapest honest source. Nearest of five samples biases toward the glass
-    // itself over background leaking through the box corners.
-    carver.set(
-      tracked.vessels.slice(0, 3).map((vessel) => {
-        let front = 0.5;
-        if (probeCells) {
-          const cx = (vessel.x0 + vessel.x1) / 2;
-          const cy = (vessel.y0 + vessel.y1) / 2;
-          const at = (x: number, y: number) => {
-            const i = Math.min(Math.max(Math.round(x * 64), 0), 63);
-            const j = Math.min(Math.max(Math.round(y * 64), 0), 63);
-            return probeCells?.[j * 64 + i] ?? 0;
-          };
-          front = Math.max(
-            at(cx, cy),
-            at(cx - 0.05, cy),
-            at(cx + 0.05, cy),
-            at(cx, cy - 0.05),
-            at(cx, cy + 0.05),
-          );
+    // cheapest honest source. The estimate has to be stable above all else:
+    // every flicker re-digs the cavity at a new depth, and that topology quake
+    // ejects whatever water had settled in it. Measured flapping between the
+    // glass (0.79) and the hand holding it (1.0) when a nearest-of-five rule
+    // sampled around the box centre. So: samples at the side-wall margins,
+    // the only texels the carve never touches, so the estimate cannot chase
+    // its own output. Both walls at three heights, then a median: the hand
+    // holding the glass covers at most one wall, and the median throws its
+    // samples away. An eased hold on top, against per-frame depth noise.
+    const cups = tracked.vessels.slice(0, 3).map((vessel) => {
+      let front = 0.5;
+      if (probeCells) {
+        const at = (x: number, y: number) => {
+          const i = Math.min(Math.max(Math.round(x * 64), 0), 63);
+          const j = Math.min(Math.max(Math.round(y * 64), 0), 63);
+          return probeCells?.[j * 64 + i] ?? 0;
+        };
+        const w = vessel.x1 - vessel.x0;
+        const h = vessel.y1 - vessel.y0;
+        const samples: number[] = [];
+        for (const tx of [0.07, 0.93]) {
+          for (const ty of [0.3, 0.5, 0.7]) {
+            samples.push(at(vessel.x0 + w * tx, vessel.y0 + h * ty));
+          }
         }
-        return { box: [vessel.x0, vessel.y0, vessel.x1, vessel.y1] as const, front };
-      }),
-    );
+        samples.sort((a, b) => a - b);
+        front = samples[3];
+      }
+      const prior = latestCups.find(
+        (old) =>
+          Math.abs(old.box[0] - vessel.x0) < 0.15 &&
+          Math.abs(old.box[1] - vessel.y0) < 0.15,
+      );
+      if (prior) {
+        front = prior.front + (front - prior.front) * 0.1;
+      }
+      return { box: [vessel.x0, vessel.y0, vessel.x1, vessel.y1] as const, front };
+    });
+    carver.set(cups);
+    // The solver gets the same cups, for the near-wall containment.
+    fluid.tune({ cups });
+    latestCups = cups;
 
   }
 
@@ -1721,6 +1743,7 @@ async function main(): Promise<void> {
       storm: () => ({ flash, gust }),
       smokeGrid: () => smoke.readCells(),
       counters: () => ({ solverSteps, encodes }),
+      cupState: () => latestCups,
       pump: (count: number) => {
         for (let index = 0; index < count; index++) {
           step(previousTime + SOLVER_STEP * 1000);
@@ -1744,7 +1767,10 @@ async function main(): Promise<void> {
   document.body.dataset.tool = medium;
   hud.setToolFilter(medium);
   hud.setFill(0);
-  hud.setStatus('info', `${PARTICLE_COUNT.toLocaleString()} particles. Hold to pour.`);
+  hud.setStatus(
+    'info',
+    `${PARTICLE_COUNT.toLocaleString()} particles · build ${__BUILD__}. Hold to pour.`,
+  );
   requestAnimationFrame(frame);
 }
 

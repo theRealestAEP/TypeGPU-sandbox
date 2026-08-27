@@ -63,12 +63,24 @@ const carveKernel = tgpu.computeFn({
     if (inside) {
       const front = carveLayout.$.depths[slot].x;
       const carve = carveLayout.$.depths[slot].y;
+      // A bowl, never a slab. A cavity with cliff edges cannot hold water
+      // under a level camera: a z-cliff seen edge-on has no height, so the
+      // weir prices crossing it at nothing and the water pours out over the
+      // base lip - measured as 99% drainage on a level webcam frame. Grading
+      // the interior into ramps gives its floor and walls image-space slope,
+      // and slopes hold water the ordinary way: their normals lean against
+      // gravity through plain contact.
+      const spanX = (uv.x - (box.x + box.z) * 0.5) / (width * (0.5 - d.f32(WALL)));
+      const sideRamp = 1 - std.smoothstep(0.45, 1, std.abs(spanX));
+      const floorRamp = 1 -
+        std.smoothstep(box.w - height * 0.36, box.w - height * d.f32(BASE), uv.y);
+      const bowl = carve * std.min(sideRamp, floorRamp);
       // Only texels that belong to the vessel itself: background seen past the
       // box's edge sits much deeper than the vessel's front and stays as it is.
-      if (std.abs(depth - front) < 0.16) {
+      if (std.abs(depth - front) < 0.16 && bowl > 0.001) {
         // Clamped above the far plane: a vessel against a deep surface would
         // otherwise carve past the back of the world and lose its floor.
-        depth = std.max(std.min(depth, front - carve), 0.02);
+        depth = std.max(std.min(depth, front - bowl), 0.02);
       }
     }
   }
