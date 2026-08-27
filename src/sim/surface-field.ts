@@ -52,6 +52,7 @@ const groundSums = tgpu.workgroupVar(d.arrayOf(d.f32, ORIENT_THREADS));
 const groundVecs = tgpu.workgroupVar(d.arrayOf(d.vec3f, ORIENT_THREADS));
 const groundShare = tgpu.workgroupVar(d.f32);
 const groundTight = tgpu.workgroupVar(d.f32);
+const groundLean = tgpu.workgroupVar(d.f32);
 /** Per-thread advance of the surface since the last update, for the mean. */
 const driftSums = tgpu.workgroupVar(d.arrayOf(d.f32, ORIENT_THREADS));
 
@@ -246,6 +247,11 @@ const orientKernel = tgpu.computeFn({
     // Mean resultant length: 1 when every ground normal agrees, small when
     // they scatter. A floor is coherent; a face is not.
     groundTight.$ = std.length(groundDir) / std.max(groundTotal, 1);
+    // How steeply the ground cluster's mean normal leans up the image. A real
+    // floor in a photo is seen at a grazing angle, so its normals lean hard
+    // up-image; a portrait's phantom ground is a depth gradient painted on
+    // the back wall, and its normals mostly face the viewer.
+    groundLean.$ = -groundDir.y / std.max(std.length(groundDir), 1e-6);
 
     // The frame: biggest cluster, then the biggest of what is left, then the
     // one square to both.
@@ -339,12 +345,17 @@ const orientKernel = tgpu.computeFn({
     // ground is not merely present, it is COHERENT - every floor texel's
     // normal points the same way, while a face's scatter over a hemisphere.
     // The prior is a level camera, and only abundant, agreeing ground moves it.
-    // The coherence knee sits at 0.78, measured, not guessed: a straight-on
-    // room shot's phantom ground - fern, shoulders, door frame - musters 0.77
-    // at best, while real floors (tub 0.86, stove 0.82) sit clear above. Below
-    // the knee the scene has no floor worth believing and the prior holds.
+    // Three gates, each measured against the bundled scenes and a real
+    // portrait, and every one is required: enough candidate texels (share),
+    // normals that agree with each other (tight), and - the decisive one - a
+    // mean normal that leans steeply up the image (lean). A portrait's
+    // phantom ground scores 0.49 lean because it is a smooth depth gradient
+    // on the wall behind the subject, while the tub floor scores 0.86 and
+    // the stove 0.76; coherence alone cannot tell those apart (0.84 vs
+    // 0.86), which is how a room shot once read 56 degrees into the scene.
     const confidence = std.saturate((groundShare.$ - 0.05) / 0.1) *
-      std.saturate((groundTight.$ - 0.78) / 0.1);
+      std.saturate((groundTight.$ - 0.78) / 0.1) *
+      std.saturate((groundLean.$ - 0.6) / 0.12);
     down = std.normalize(std.mix(d.vec3f(0, 1, 0), down, confidence));
 
     // The source's own prior caps the pitch outright. Three rounds of ever
@@ -391,6 +402,7 @@ const orientKernel = tgpu.computeFn({
     orientLayout.$.scene.drift = driftShared.$;
     orientLayout.$.scene.groundShare = groundShare.$;
     orientLayout.$.scene.groundTight = groundTight.$;
+    orientLayout.$.scene.groundLean = groundLean.$;
   }
 });
 
@@ -465,7 +477,7 @@ export function createSurfaceField(
     })
     .$usage('uniform');
   const scene = root
-    .createBuffer(SceneState, { down: d.vec3f(0, 1, 0), drift: 0, groundShare: 0, groundTight: 0 })
+    .createBuffer(SceneState, { down: d.vec3f(0, 1, 0), drift: 0, groundShare: 0, groundTight: 0, groundLean: 0 })
     .$usage('storage');
   const scratch = createFieldTexture(root, FIELD_RES);
   const surface = createFieldTexture(root, FIELD_RES);

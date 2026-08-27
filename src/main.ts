@@ -498,7 +498,7 @@ async function main(): Promise<void> {
     // scene's tilt - the webcam was opening with the city's steep pitch.
     gravityManual = false;
     field.tune({ manual: false });
-    field.scene.write({ down: [0, 1, 0], drift: 0, groundShare: 0, groundTight: 0 });
+    field.scene.write({ down: [0, 1, 0], drift: 0, groundShare: 0, groundTight: 0, groundLean: 0 });
     // An active pour re-arms its medium; without this a scenario that resets
     // and then pours smoke had its smoke switched off by its own reset.
     applyFlow();
@@ -1048,6 +1048,11 @@ async function main(): Promise<void> {
   async function useDroppedFile(file: File): Promise<void> {
     try {
       hud.setStatus('info', `Reading ${file.name}…`);
+      // A dropped file is a new scene, and a new scene measures its own
+      // gravity. The pin used to survive drops, so one touched slider poisoned
+      // every image loaded after it.
+      gravityManual = false;
+      field.tune({ manual: false });
 
       if (file.type.startsWith('video/')) {
         if (clipUrl) {
@@ -1744,6 +1749,8 @@ async function main(): Promise<void> {
       smokeGrid: () => smoke.readCells(),
       counters: () => ({ solverSteps, encodes }),
       cupState: () => latestCups,
+      probeCells: () => probeCells,
+      gestureState: () => (gestures ? 'loaded' : gesturesLoading ? 'loading' : 'none'),
       pump: (count: number) => {
         for (let index = 0; index < count; index++) {
           step(previousTime + SOLVER_STEP * 1000);

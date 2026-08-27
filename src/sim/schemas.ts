@@ -261,6 +261,8 @@ export const SceneState = d.struct({
   groundShare: d.f32,
   /** Mean resultant length of those normals - how much they agree. */
   groundTight: d.f32,
+  /** Up-image steepness of their mean - real floors lean, wall gradients face. */
+  groundLean: d.f32,
 });
 
 /** How a camera frame is cropped and turned to line up with the field. */
