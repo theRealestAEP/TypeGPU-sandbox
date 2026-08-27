@@ -280,7 +280,14 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
   if (belongsBehind) {
     const back = surfaceBackAt(resolved.xy);
     const backGap = resolved.z - back;
-    if (back > playZ && backGap < 0) {
+    // The background is a finite slab exactly like the live surface. Without
+    // the lower bound it was an infinite wall: a person sitting still is
+    // adopted as scenery within seconds, and water deliberately spouted
+    // behind them - deeper than the whole slab - was walked forward step by
+    // step until it surfaced on their face. Deeper than one shell behind the
+    // remembered scene is open air: the water falls freely, hidden by what
+    // stands in front of it, until something at its own depth catches it.
+    if (back > playZ && backGap < 0 && backGap > -params.surfaceShell) {
       resolved = d.vec3f(
         resolved.xy,
         resolved.z + std.min(-backGap, params.pushLimit),

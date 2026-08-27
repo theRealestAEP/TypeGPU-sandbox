@@ -161,6 +161,9 @@ const lampLight = (
 
 const splatLayout = tgpu.bindGroupLayout({
   splat: { uniform: SplatParams },
+  field: { uniform: FieldParams },
+  scene: { texture: d.texture2d(d.f32) },
+  linear: { sampler: 'filtering' },
 });
 
 /**
@@ -196,7 +199,7 @@ const cameraSlot = tgpu.slot<boolean>();
 
 const splatVertex = tgpu.vertexFn({
   in: { pos: d.vec3f, vel: d.vec3f, vertex: d.builtin.vertexIndex },
-  out: { position: d.builtin.position, offset: d.vec2f, centre: d.f32 },
+  out: { position: d.builtin.position, offset: d.vec2f, centre: d.f32, spot: d.vec2f },
 })(({ pos, vel, vertex }) => {
   'use gpu';
   const corner = quadCorners.$[vertex];
@@ -226,8 +229,25 @@ const splatVertex = tgpu.vertexFn({
     position: d.vec4f(point.x * 2 - 1, 1 - point.y * 2, 0.5, 1),
     offset: d.vec2f(corner),
     centre: centre.z,
+    spot: d.vec2f(point),
   };
 });
+
+/**
+ * Scene depth at a splat's own texel, for occlusion at the source. The splat
+ * passes are depth-blind toward the SCENE: thickness is additive in 2D, so
+ * water deliberately spouted behind a person still piled its optical mass
+ * onto their face, and one stray front droplet made the whole hidden column
+ * render. Water deeper than the scene by more than a jitter allowance simply
+ * does not splat - it is behind something, and the something is opaque.
+ */
+const splatOccluderAt = (uv: d.v2f) => {
+  'use gpu';
+  return (
+    std.textureSample(splatLayout.$.scene, splatLayout.$.linear, uv).x *
+    splatLayout.$.field.depthScale
+  );
+};
 
 /**
  * Nearest-surface pass. Each particle is a sphere; the depth test keeps whichever
@@ -235,12 +255,13 @@ const splatVertex = tgpu.vertexFn({
  * coverage flag so the blur afterwards can average only over covered texels.
  */
 const splatDepthFragment = tgpu.fragmentFn({
-  in: { offset: d.vec2f, centre: d.f32 },
+  in: { offset: d.vec2f, centre: d.f32, spot: d.vec2f },
   out: { surface: d.vec4f, depth: d.builtin.fragDepth },
-})(({ offset, centre }) => {
+})(({ offset, centre, spot }) => {
   'use gpu';
+  const occluder = splatOccluderAt(spot);
   const radial = std.dot(offset, offset);
-  if (radial > 1) {
+  if (radial > 1 || centre < occluder - d.f32(KERNEL_RADIUS) * 2) {
     std.discard();
   }
   const bulge = std.sqrt(std.max(1 - radial, 0)) * splatLayout.$.splat.radius;
@@ -253,12 +274,13 @@ const splatDepthFragment = tgpu.fragmentFn({
 });
 
 const splatThicknessFragment = tgpu.fragmentFn({
-  in: { offset: d.vec2f, centre: d.f32 },
+  in: { offset: d.vec2f, centre: d.f32, spot: d.vec2f },
   out: d.vec4f,
-})(({ offset }) => {
+})(({ offset, centre, spot }) => {
   'use gpu';
+  const occluder = splatOccluderAt(spot);
   const radial = std.dot(offset, offset);
-  if (radial > 1) {
+  if (radial > 1 || centre < occluder - d.f32(KERNEL_RADIUS) * 2) {
     std.discard();
   }
   const falloff = 1 - radial;
@@ -943,7 +965,12 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
   const rawThicknessView = rawThickness.createView('render');
   const depthBufferView = depthBuffer.createView('render');
 
-  const splatBindGroup = root.createBindGroup(splatLayout, { splat: splatParams });
+  const splatBindGroup = root.createBindGroup(splatLayout, {
+    splat: splatParams,
+    field: inputs.fieldParams,
+    scene: inputs.scene.createView(),
+    linear: inputs.linear,
+  });
 
   const compositeBindGroup = root.createBindGroup(compositeLayout, {
     field: inputs.fieldParams,
