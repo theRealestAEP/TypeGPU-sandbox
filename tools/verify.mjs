@@ -19,6 +19,10 @@ const page = await browser.newPage();
 const failures = [];
 page.on('console', (message) => {
   const text = message.text();
+  // Optional-feature notices mention "shader" without being failures.
+  if (text.includes('webgpu-feature-missing')) {
+    return;
+  }
   if (message.type() === 'error' || /WGSL|shader|compil/i.test(text)) {
     failures.push(`${message.location()?.url ?? ''}: ${text}`);
   }

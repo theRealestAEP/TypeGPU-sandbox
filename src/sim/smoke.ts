@@ -8,6 +8,7 @@ import type {
 } from 'typegpu';
 import type { SingleChannelTexture } from '../gpu/blur.ts';
 import {
+  LightState,
   MAX_DEPTH_SCALE,
   SceneState,
   PRESSURE_ITERATIONS,
@@ -41,24 +42,34 @@ import {
  */
 
 /** Steps the bake pass walks toward the light while measuring shadow. */
-const SHADOW_STEPS = 8;
+const SHADOW_STEPS = 12;
 const SHADOW_STRIDE = SMOKE_CELL * 2;
+/**
+ * The shadow march uses a softened extinction. At the full coefficient a plume
+ * a few cells thick is pitch black inside, but real smoke is not: light that
+ * scatters sideways keeps re-entering the shadowed core. Scaling the march
+ * down is the standard one-number stand-in for that multiple scattering.
+ */
+const SHADOW_SOFTEN = 0.35;
 
 /** Gust units to grid units. The storm hands over roughly +/-0.5. */
 const WIND_SCALE = 0.35;
+
+/**
+ * Gain on the emitted density. The emit-rate scale the controls expose was
+ * tuned when the march shaded thinly; the Beer-powder march wants real optical
+ * depth to bite into, and this gain gets it there without renumbering every
+ * scenario and slider.
+ */
+const EMIT_GAIN = 2.5;
 
 /**
  * Ceiling on cell density, so a parked source cannot run away. Set low: past the
  * point where a cell is already opaque, more density only widens the plateau of
  * fully dark smoke, and the plateau has a hard edge where the cap bites.
  */
-const DENSITY_CAP = 2.5;
+const DENSITY_CAP = 3;
 
-/**
- * Light that reaches smoke the sun cannot see, bounced off everything else.
- * Without it a thick plume goes to the shadow colour and reads as a hole.
- */
-const AMBIENT = 0.18;
 /**
  * Sky light from straight above, occluded by the plume itself. This is what
  * puts a dark underside under a lit top: the bake marches down as well as
@@ -67,6 +78,44 @@ const AMBIENT = 0.18;
  */
 const SKY_STEPS = 6;
 const SKY_STRIDE = SMOKE_CELL * 2.5;
+
+/**
+ * The two Henyey-Greenstein lobes of the march's phase function, and the share
+ * the forward lobe gets. Forward scattering is what makes smoke flare when the
+ * light sits behind it; the small backward lobe is the retro-reflection that
+ * keeps a front-lit plume from going flat.
+ */
+const FORWARD_G = 0.6;
+const BACK_G = -0.25;
+const FORWARD_SHARE = 0.6;
+
+/** Gain on the direct sun term, on top of the phase function. */
+const SUN_BOOST = 1.35;
+/** Sky light a fully unshadowed cell receives, relative to the sun term. */
+const SKY_LEVEL = 0.65;
+/**
+ * Multiple scattering, as a floor that grows where the sun term dies. Real
+ * smoke bounces light between its own grains, so the deepest core still glows
+ * faintly instead of going to black.
+ */
+const MS_FLOOR = 0.5;
+
+/** Image-space margin over which smoke fades out before the grid boundary. */
+const EDGE_FADE = 0.07;
+/** Depth margin doing the same job on the near and far faces of the grid. */
+const Z_FADE = SMOKE_CELL * 3;
+
+/**
+ * Detail noise that erodes the plume during the march. The grid is 64 cells
+ * across and the image 448, so trilinear sampling alone reads as frosted
+ * glass; carving the sampled density with sub-cell noise is what turns the
+ * smooth column into billows. Erosion bites hardest where the smoke is thin,
+ * so cores stay solid while edges break into rolls.
+ */
+const NOISE_FREQ = 22;
+const EROSION = 0.65;
+/** How fast the detail pattern climbs, in noise cells per second. */
+const NOISE_RISE = 1.4;
 
 /**
  * Ceiling on speed, in cells per fixed tick. Vorticity confinement returns
@@ -106,8 +155,8 @@ const renderLayout = tgpu.bindGroupLayout({
   params: { uniform: SmokeParams },
   volume: { texture: d.texture3d(d.f32) },
   scene: { texture: d.texture2d(d.f32) },
-  /** Unit "down" in camera axes, for the height gradient in the march. */
-  sceneState: { storage: SceneState, access: 'readonly' },
+  /** The light measured from the picture: colour, ambient, and how sure it is. */
+  light: { storage: LightState, access: 'readonly' },
   volumeSampler: { sampler: 'filtering' },
   image: { storageTexture: d.textureStorage2d('rgba16float', 'write-only' as const) },
 });
@@ -248,9 +297,30 @@ const advectKernel = tgpu.computeFn({
       randomUnit(seed + 1) - 0.5,
       randomUnit(seed + 2) - 0.5,
     );
-    density += params.emitRate * strength * params.dt;
+    density += params.emitRate * d.f32(EMIT_GAIN) * strength * params.dt;
     heat += params.emitHeat * strength * params.dt;
     vel = vel + jitter * (strength * params.emitHeat * params.dt * 0.05);
+  }
+
+  // Standing sources: same physics as the spout, one per planted object.
+  for (const slot of std.range(4)) {
+    const prop = params.props[slot];
+    if (prop.w > 0.001) {
+      const traits = params.propTraits[slot];
+      const gap = std.length(centre - prop.xyz);
+      const near = 1 - std.smoothstep(0, traits.x, gap);
+      if (near > 0) {
+        const propSeed = index * 2654435761 + params.frame + slot * 7919;
+        const kick = d.vec3f(
+          randomUnit(propSeed) - 0.5,
+          randomUnit(propSeed + 1) - 0.5,
+          randomUnit(propSeed + 2) - 0.5,
+        );
+        density += prop.w * d.f32(EMIT_GAIN) * near * params.dt;
+        heat += traits.y * near * params.dt;
+        vel = vel + kick * (near * traits.y * params.dt * 0.05);
+      }
+    }
   }
 
   // Both are amounts of something, so neither can be less than nothing. The
@@ -506,7 +576,7 @@ const bakeKernel = tgpu.computeFn({
       cell.z < SMOKE_Z;
     if (inside) {
       const blocker = bakeLayout.$.cells[cellIndexAt(cell)].density;
-      light *= std.exp(-blocker * params.opacity * d.f32(SHADOW_STRIDE));
+      light *= std.exp(-blocker * params.opacity * d.f32(SHADOW_STRIDE * SHADOW_SOFTEN));
     }
   }
 
@@ -525,20 +595,57 @@ const bakeKernel = tgpu.computeFn({
       cell.y < SMOKE_Y && cell.x >= 0 && cell.x < SMOKE_X && cell.z >= 0 && cell.z < SMOKE_Z;
     if (inGrid) {
       const blocker = bakeLayout.$.cells[cellIndexAt(cell)].density;
-      sky *= std.exp(-blocker * params.opacity * d.f32(SKY_STRIDE) * 0.5);
+      sky *= std.exp(-blocker * params.opacity * d.f32(SKY_STRIDE) * 0.35);
     }
   }
 
-  // Multiple scattering lifts the darkest interior; the sky term shapes what
-  // remains. Written as (density, light) for the march.
-  const lit = std.mix(d.f32(AMBIENT), 1, light);
-  const shaded = lit * (0.35 + 0.65 * sky);
+  // Raw transmittances, not a finished shade: the march owns the lighting
+  // model, and it wants the sun and sky occlusions separately - the powder
+  // term needs the sun's optical depth on its own.
   std.textureStore(
     bakeLayout.$.volume,
     gid,
-    d.vec4f(density, shaded, 0, 1),
+    d.vec4f(density, light, sky, 1),
   );
 });
+
+/**
+ * One Henyey-Greenstein lobe, normalised against the isotropic phase: 1 means
+ * "as bright as smoke that scatters evenly". Relative units keep the lighting
+ * constants in an ordinary 0..2 range instead of dragging 1/4pi through them.
+ */
+const hgLobe = (g: number, cosTheta: number) => {
+  'use gpu';
+  const gg = g * g;
+  const base = 1 + gg - 2 * g * cosTheta;
+  return (1 - gg) / (base * std.sqrt(base) + 0.0001);
+};
+
+const latticeHash = (corner: d.v3f) => {
+  'use gpu';
+  return std.fract(std.sin(std.dot(corner, d.vec3f(127.1, 311.7, 74.7))) * 43758.5453);
+};
+
+/** Trilinear value noise on a unit lattice, 0..1. */
+const valueNoise = (position: d.v3f) => {
+  'use gpu';
+  const cell = std.floor(position);
+  const offset = position - cell;
+  const eased = offset * offset * (d.vec3f(3) - offset * 2);
+  let total = d.f32(0);
+  for (const stepZ of tgpu.unroll([0, 1])) {
+    for (const stepY of tgpu.unroll([0, 1])) {
+      for (const stepX of tgpu.unroll([0, 1])) {
+        const weight =
+          std.mix(1 - eased.x, eased.x, d.f32(stepX)) *
+          std.mix(1 - eased.y, eased.y, d.f32(stepY)) *
+          std.mix(1 - eased.z, eased.z, d.f32(stepZ));
+        total += latticeHash(cell + d.vec3f(d.f32(stepX), d.f32(stepY), d.f32(stepZ))) * weight;
+      }
+    }
+  }
+  return total;
+};
 
 /**
  * Front-to-back march through the volume.
@@ -547,6 +654,12 @@ const bakeKernel = tgpu.computeFn({
  * z at a fixed image position - the march is a column integral, and the scene's
  * own depth is where it stops, which is what puts smoke behind a mug rather than
  * over it.
+ *
+ * Each step shades with Beer-powder: extinction says how much of the step's
+ * smoke is seen, and the powder term - one minus the sun transmittance squared
+ * - says how much sunlight actually scatters there. Their product is dark at
+ * the thin sunlit skin, brightest one optical depth in, and dark again in the
+ * core, which is the banded, rolled look that makes a plume read as thick.
  */
 const renderKernel = tgpu.computeFn({
   workgroupSize: [RENDER_WORKGROUP, RENDER_WORKGROUP],
@@ -562,12 +675,41 @@ const renderKernel = tgpu.computeFn({
     std.textureSampleLevel(renderLayout.$.scene, renderLayout.$.volumeSampler, uv, 0).x *
     params.depthScale;
 
-  // The measured up, flattened to a unit vector: the march has no view of the
-  // scene, but smoke still fades toward the sky the way a thick plume does.
-  const up = std.normalize(renderLayout.$.sceneState.down * -1);
   // A pseudo view ray, so the phase term has a direction to work with. The
   // simulation is orthographic, but smoke scatters as if seen through a lens.
   const toEye = std.normalize(d.vec3f((d.vec2f(0.5) - uv) * 0.35, 1));
+  // Angle between the sunlight's direction of travel and the path to the eye.
+  const cosTheta = std.dot(params.sun * -1, toEye);
+  const phase = std.mix(
+    hgLobe(BACK_G, cosTheta),
+    hgLobe(FORWARD_G, cosTheta),
+    d.f32(FORWARD_SHARE),
+  );
+
+  // The measured scene light, when the depth pipeline has one it trusts.
+  // Strength 0 - no camera frame, or a flat scene - leaves the tints neutral.
+  const sunTint = std.mix(
+    d.vec3f(1),
+    renderLayout.$.light.colour * 1.25,
+    renderLayout.$.light.strength,
+  );
+  const ambientLum = std.dot(renderLayout.$.light.ambient, d.vec3f(0.299, 0.587, 0.114));
+  const ambientTint = std.mix(
+    d.vec3f(0.84, 0.88, 0.96),
+    renderLayout.$.light.ambient / (ambientLum + 0.001),
+    renderLayout.$.light.strength * 0.7,
+  );
+
+  // Fade toward the image-plane bounds, so the plume dissolves at the edge of
+  // the grid instead of being cut by it.
+  const edge =
+    std.smoothstep(0, EDGE_FADE, uv.x) *
+    std.smoothstep(0, EDGE_FADE, 1 - uv.x) *
+    std.smoothstep(0, EDGE_FADE, uv.y) *
+    std.smoothstep(0, EDGE_FADE, 1 - uv.y);
+
+  // The detail pattern climbs so the billows appear to rise with the smoke.
+  const drift = d.f32(params.frame) * (d.f32(NOISE_RISE) / 60);
 
   let colour = d.vec3f();
   let transmittance = d.f32(1);
@@ -579,22 +721,34 @@ const renderKernel = tgpu.computeFn({
       d.vec3f(uv, z / d.f32(Z_MAX)),
       0,
     );
-    if (z > stop) {
-      const opacity = 1 - std.exp(-sample.x * params.opacity * d.f32(SMOKE_CELL));
-      // Two-lobe phase: back-scattering (sun behind the plume, toward the eye)
-      // brightens it, forward-scattering keeps the rest from going flat.
-      const sunDot = std.dot(toEye, params.sun);
-      const phase = 0.75 + 0.35 * std.saturate(-sunDot) + 0.2 * sunDot * sunDot;
-      // Height falloff toward the measured sky: thin smoke high up lets the
-      // ambient through, dense base holds its shade.
-      const heightFade = std.saturate(std.dot(d.vec3f(uv, z / d.f32(Z_MAX)), up) * 1.5 + 0.5);
-      const lit = std.mix(
-        params.shade,
-        params.tint,
-        sample.y,
-      ) * std.mix(d.vec3f(0.75, 0.8, 0.9), d.vec3f(1), heightFade);
-      colour = colour + lit * (opacity * transmittance * phase);
+    if (z > stop && sample.x > 0.004) {
+      // Two octaves of erosion. Thin smoke erodes fully, so edges break into
+      // billows; past a density of about one the noise cannot reach the core.
+      const spot = d.vec3f(uv, z);
+      const detail =
+        valueNoise(spot * d.f32(NOISE_FREQ) + d.vec3f(0, drift, 0)) * 0.65 +
+        valueNoise(spot * (d.f32(NOISE_FREQ) * 2.6) + d.vec3f(0, drift * 1.7, 0)) * 0.35;
+      const sigma = std.max(
+        sample.x - detail * d.f32(EROSION) * std.saturate(1.2 - sample.x),
+        0,
+      );
+      const fade =
+        edge * std.smoothstep(0, d.f32(Z_FADE), z) *
+        std.smoothstep(0, d.f32(Z_FADE), d.f32(Z_MAX) - z);
+      const opacity = 1 - std.exp(-sigma * fade * params.opacity * d.f32(SMOKE_CELL));
+      const sunTrans = sample.y;
+      const powder = 1 - sunTrans * sunTrans;
+      const sunTerm = 2 * sunTrans * powder * phase * d.f32(SUN_BOOST);
+      const skyTerm = (0.3 + 0.7 * sample.z) * d.f32(SKY_LEVEL);
+      const lit =
+        params.tint * (sunTint * sunTerm + ambientTint * skyTerm) +
+        params.shade * (d.f32(MS_FLOOR) * (1 - sunTrans));
+      colour = colour + lit * (opacity * transmittance);
       transmittance *= 1 - opacity;
+    }
+    // Past this the remaining smoke cannot show; the march has done its job.
+    if (transmittance < 0.004) {
+      break;
     }
   }
 
@@ -608,6 +762,8 @@ export interface SmokeTuning {
   emitterZ: number;
   emitRadius: number;
   emitRate: number;
+  /** Planted sources: position, rate, footprint, heat. */
+  props: readonly { at: readonly [number, number, number]; rate: number; radius: number; heat: number }[];
   emitHeat: number;
   buoyancy: number;
   cooling: number;
@@ -627,28 +783,41 @@ export const defaultSmokeTuning: SmokeTuning = {
   emitterZ: Z_MAX * 0.55,
   // A source only a few cells across can only make a ribbon. Widening it is what
   // gives the plume room to roll over on itself and show any structure at all.
-  emitRadius: 0.11,
+  emitRadius: 0.15,
   emitRate: 0,
+  props: [],
   emitHeat: 7,
-  buoyancy: 2.4,
-  cooling: 0.55,
-  dissipation: 0.15,
+  // Gentle lift. A plume that races upward stretches into a ribbon before it
+  // can roll; a slower climb keeps it fat enough to billow.
+  buoyancy: 1.9,
+  cooling: 0.5,
+  // Slow decay: smoke that lingers is what fills the volume and rolls. Fast
+  // decay leaves only the fresh core, which is exactly the thin-haze look.
+  dissipation: 0.09,
   wind: 0,
-  swirl: 20,
+  swirl: 30,
   drag: 0.1,
   depthScale: MAX_DEPTH_SCALE,
-  opacity: 26,
+  opacity: 38,
   sunBearing: -30,
   sunHeight: 44,
 };
 
-const SHADE: [number, number, number] = [0.2, 0.21, 0.24];
-const TINT: [number, number, number] = [0.9, 0.91, 0.93];
+/** Colour of the multiple-scattering floor in the deep core. */
+const SHADE: [number, number, number] = [0.34, 0.35, 0.39];
+/** Albedo of the smoke itself; the light terms multiply it. */
+const TINT: [number, number, number] = [0.93, 0.94, 0.96];
 
 export interface SmokeInputs {
   readonly surface: SingleChannelTexture;
   readonly scene: TgpuBuffer<typeof SceneState> & StorageFlag;
   readonly fieldSampler: TgpuSampler;
+  /**
+   * The light measured from the picture, owned by the depth pipeline. Optional:
+   * without it the march lights with a neutral white sun and the direction the
+   * sunBearing/sunHeight params already carry.
+   */
+  readonly light?: TgpuBuffer<typeof LightState> & StorageFlag;
 }
 
 export interface Smoke {
@@ -703,6 +872,20 @@ export function createSmoke(root: TgpuRoot, inputs: SmokeInputs): Smoke {
     .createTexture({ size: [SMOKE_RES, SMOKE_RES], format: 'rgba16float' })
     .$usage('sampled', 'storage');
 
+  // A stand-in when no measured light is wired in: strength 0, so every tint
+  // in the march stays at its neutral default.
+  const ownsLight = inputs.light === undefined;
+  const light =
+    inputs.light ??
+    root
+      .createBuffer(LightState, {
+        sun: [0, 0, 1],
+        colour: [1, 1, 1],
+        ambient: [0.5, 0.5, 0.5],
+        strength: 0,
+      })
+      .$usage('storage');
+
   /**
    * The cell buffers swap once a step; the pressure buffers swap every Jacobi
    * sweep. The two are independent, so each cell phase gets both pressure
@@ -749,7 +932,7 @@ export function createSmoke(root: TgpuRoot, inputs: SmokeInputs): Smoke {
     params,
     volume: volume.createView(d.texture3d(d.f32)),
     scene: inputs.surface.createView(),
-    sceneState: inputs.scene,
+    light,
     volumeSampler: inputs.fieldSampler,
     image: image.createView(d.textureStorage2d('rgba16float', 'write-only' as const)),
   });
@@ -780,6 +963,14 @@ export function createSmoke(root: TgpuRoot, inputs: SmokeInputs): Smoke {
       emitter: [tuning.emitterX, tuning.emitterY, tuning.emitterZ],
       emitRadius: tuning.emitRadius,
       emitRate: tuning.emitRate,
+      props: Array.from({ length: 4 }, (_, i) => {
+        const prop = tuning.props[i];
+        return prop ? [prop.at[0], prop.at[1], prop.at[2], prop.rate] : [0, 0, 0, 0];
+      }),
+      propTraits: Array.from({ length: 4 }, (_, i) => {
+        const prop = tuning.props[i];
+        return prop ? [prop.radius, prop.heat, 0, 0] : [0.05, 0, 0, 0];
+      }),
       emitHeat: tuning.emitHeat,
       buoyancy: tuning.buoyancy,
       cooling: tuning.cooling,
@@ -876,6 +1067,9 @@ export function createSmoke(root: TgpuRoot, inputs: SmokeInputs): Smoke {
       curl.destroy();
       volume.destroy();
       image.destroy();
+      if (ownsLight) {
+        light.destroy();
+      }
     },
   };
 }

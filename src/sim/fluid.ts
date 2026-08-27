@@ -20,7 +20,6 @@ import {
   Particle,
   ParticleArray,
   REST_DENSITY,
-  REST_SPACING,
   SOLVER_ITERATIONS,
   SceneState,
   SimParams,
@@ -49,17 +48,6 @@ const DORMANT_Y = 8;
 const RAIN_TOP = 0.02;
 
 
-/**
- * Nothing starts in frame. The old block of water dropped into the scene at load
- * was placed at fixed coordinates with no idea what was behind it, so part of it
- * spawned inside the scene's own geometry and stuck there. At 80,000 particles
- * that read as a stray blob; at half a million it is a sheet of glass hanging
- * across the top of the picture, which is what "the whole scene looks submerged"
- * was. Water now only ever enters through the spout, in open air, in front of
- * whatever the camera can see.
- */
-export const START_FRACTION = 0;
-
 /** Floats per particle: three vec3f, each padded to 16 bytes. */
 const FLOATS_PER_PARTICLE = 12;
 
@@ -85,6 +73,14 @@ const surfaceNowAt = (image: d.v2f) => {
   'use gpu';
   return (
     std.textureSampleLevel(simLayout.$.surface, simLayout.$.fieldSampler, image, 0).x *
+    simLayout.$.params.depthScale
+  );
+};
+
+const surfaceBackAt = (image: d.v2f) => {
+  'use gpu';
+  return (
+    std.textureSampleLevel(simLayout.$.surfaceBack, simLayout.$.fieldSampler, image, 0).x *
     simLayout.$.params.depthScale
   );
 };
@@ -151,11 +147,36 @@ const resolveSurface = (from: d.v3f, position: d.v3f) => {
   // down on the far side, one step per contact, and the pool leaks its whole
   // contents over the brim. A particle already inside something is left alone -
   // it is being pressed in by a pour or a paw, not walking through.
+  const wallSurf = surfaceAt(position.xy);
   if (
-    position.z - surfaceAt(position.xy) < -params.surfaceShell &&
+    position.z - wallSurf < -params.surfaceShell &&
     from.z - surfaceAt(from.xy) > -params.surfaceShell
   ) {
-    resolved = d.vec3f(from.xy, position.z);
+    // The weir rule. A flat refusal here dammed the front rim forever: crossing
+    // it demands z-clearance, and with gravity nearly level in z that clearance
+    // costs twenty-odd times the true potential barrier - so a brim-full tub
+    // could never overflow toward the camera, and the only open exit was up
+    // the back wall (water there rides in FRONT of a deeper surface and is
+    // never refused). Real water passes a barrier when its level reaches the
+    // crest, so that is the test: elevation along measured gravity, not
+    // clearance in z. Over the crest, the particle lands ON the barrier and
+    // cascades down the far side, which is what overflowing looks like.
+    // The crest test must be about where the particle would LAND, not the
+    // texel it is stepping onto. Tested against the flank, every wall becomes a
+    // staircase: each hop lands on top of the flank at raised z, which at a
+    // steep pitch RAISES the particle's elevation and funds the next hop -
+    // water walked up the sink's rim one texel at a time and the whole pool
+    // drained over the counter. Spilling means going downhill: the landing may
+    // never sit meaningfully above where the particle already was.
+    const downNow = simLayout.$.scene.down;
+    const landZ = wallSurf + params.kernelRadius * 1.5;
+    const landing = -(downNow.x * position.x + downNow.y * position.y + downNow.z * landZ);
+    const mine = -std.dot(downNow, from);
+    if (landing <= mine + 0.005) {
+      resolved = d.vec3f(position.xy, landZ);
+    } else {
+      resolved = d.vec3f(from.xy, position.z);
+    }
   }
 
   const surface = surfaceAt(resolved.xy);
@@ -219,6 +240,22 @@ const resolveSurface = (from: d.v3f, position: d.v3f) => {
     // solver stops paying for the crawl.
     if (behind) {
       resolved = d.vec3f(resolved.xy, surface + params.kernelRadius * 0.5);
+    }
+  }
+
+  // Behind a passing occluder is not open air. A hand crossing the sink
+  // REPLACES the sink in the heightfield, so water under it lost its floor and
+  // fell through - the whole pool scattering whenever a hand passed over. The
+  // background layer remembers what the occluder covered, and water behind the
+  // live surface supports against the scene that is still really there.
+  if (stayedBehind) {
+    const back = surfaceBackAt(resolved.xy);
+    const backGap = resolved.z - back;
+    if (back > playZ && backGap < 0) {
+      resolved = d.vec3f(
+        resolved.xy,
+        resolved.z + std.min(-backGap, params.pushLimit),
+      );
     }
   }
 
@@ -311,12 +348,18 @@ const predictKernel = tgpu.computeFn({
       velocity = d.vec3f(across * 3 * params.emitSpread, params.emitSpeed, through * 3 * params.emitSpread);
     }
 
-    // The spout pours from the depth it was aimed at, full stop. It used to be
-    // shoved in front of whatever covered that texel, so putting a hand over
-    // the source made the water land on top of the hand. That was a patch over
-    // the collision treating everything behind a surface as inside it; with the
-    // slab finite (see resolveSurface) the water simply falls behind the hand
-    // and the compositor hides it there, which is what the eye expects.
+    // The pour lands on the world under the spout. Left at its raw depth, a
+    // near-camera spout rains a sheet in front of everything in the frame - on
+    // a webcam that reads as water thrown at the viewer, and on the tub it was
+    // the pour missing the basin entirely. Spawning just in front of whatever
+    // the scene holds at that spot pours ONTO things: a basin fills, a person
+    // gets rained on, a hand held over the spout catches the stream. Scrolling
+    // the spout deeper still works - the clamp only stops spawning nearer than
+    // the scene, never deeper into it.
+    const under = surfaceAt(position.xy) + params.kernelRadius * 4;
+    if (position.z > under) {
+      position = d.vec3f(position.xy, under);
+    }
   }
 
   // Down as the scene measures it. Gravity along -z alone reads as the safe
@@ -328,7 +371,10 @@ const predictKernel = tgpu.computeFn({
   // gravity is what the normal force exists to balance; the wall test in
   // resolveSurface is what stops the tangential part running the pool over the
   // near rim.
-  velocity = velocity + simLayout.$.scene.down * (params.gravity * params.dt);
+  const calmHere = std.saturate(simLayout.$.deltas[gid.x].w);
+  velocity = velocity +
+    simLayout.$.scene.down *
+      (params.gravity * params.dt * (1 - CALM_GRAVITY_RELIEF * calmHere));
 
   // Never step further than a kernel radius, or neighbours are found too late.
   const reach = std.length(velocity) * params.dt;
@@ -550,6 +596,47 @@ const finalizeKernel = tgpu.computeFn({
   });
 });
 
+/**
+ * Below this neighbourhood speed, water is settling rather than flowing, and
+ * the smoothing is allowed to climb toward CALM_VISCOSITY.
+ */
+const CALM_SPEED = 0.25;
+
+/**
+ * XSPH coefficient for still water. The free surface of a PBF pool never
+ * settles on its own: a particle there measures only density deficit, which
+ * the compression-only constraint ignores, so pressure from below flicks it
+ * up, gravity drops it back, and it pops like that forever - the simmer that
+ * no amount of render smoothing could hide. Keying the smoothing on the
+ * neighbourhood's speed rather than the particle's own is what kills exactly
+ * the popcorn: a popping particle sits among slow neighbours and gets dragged
+ * hard to their mean, while a splash sits among fast ones and keeps its life.
+ */
+const CALM_VISCOSITY = 0.45;
+
+/**
+ * Fraction of velocity removed per step in fully calm water. Smoothing alone
+ * halves the popcorn while the pool settles but cannot finish the job - it
+ * drags particles toward a neighbourhood mean that is itself oscillating, so
+ * the simmer converges to a floor instead of to zero. This term removes energy
+ * outright, and only where the neighbourhood is already nearly still: a splash
+ * scores calm = 0 and loses nothing.
+ */
+const SLEEP_DAMP = 0.2;
+
+/**
+ * How much of gravity calm water is spared. The simmer has a floor that no
+ * damping can reach, because its source refills every substep: gravity adds
+ * g*dt, the solver cancels it imperfectly, and the leftover is re-injected
+ * fresh - the measured floor sits at about 1.5x g*dt regardless of how hard
+ * the surroundings are damped. But water whose neighbourhood is still IS in
+ * hydrostatic balance; that is what still means. So calm water takes only the
+ * sliver of gravity the balance argument does not cover, and the injection
+ * shrinks by the same factor as the floor. A disturbance raises neighbourhood
+ * speed, calm collapses, and full gravity returns within a step.
+ */
+const CALM_GRAVITY_RELIEF = 0.9;
+
 const viscosityKernel = tgpu.computeFn({
   workgroupSize: [WORKGROUP_SIZE],
   in: { gid: d.builtin.globalInvocationId },
@@ -564,6 +651,9 @@ const viscosityKernel = tgpu.computeFn({
   const radius = params.kernelRadius;
 
   let smoothed = d.vec3f();
+  let speedSum = d.f32(0);
+  let weightSum = d.f32(0);
+  let outward = d.vec3f();
   const home = clampCell(cellCoordOf(position));
   for (const stepZ of std.range(-1, 2)) {
     for (const stepY of std.range(-1, 2)) {
@@ -577,8 +667,12 @@ const viscosityKernel = tgpu.computeFn({
             const offset = position - simLayout.$.particles[other].pos;
             const distanceSq = std.dot(offset, offset);
             if (distanceSq < radius * radius) {
+              const weight = poly6Weight(distanceSq, radius, params.poly6);
               const difference = simLayout.$.particles[other].vel - velocity;
-              smoothed = smoothed + difference * poly6Weight(distanceSq, radius, params.poly6);
+              smoothed = smoothed + difference * weight;
+              speedSum += std.length(simLayout.$.particles[other].vel) * weight;
+              weightSum += weight;
+              outward = outward + offset * weight;
             }
           }
         }
@@ -586,10 +680,61 @@ const viscosityKernel = tgpu.computeFn({
     }
   }
 
+  // How fast this particle's surroundings are moving, not how fast it is. The
+  // distinction is the whole trick - see CALM_VISCOSITY.
+  const around = speedSum / std.max(weightSum, 1e-6);
+  // Calm needs support as well as stillness. The hydrostatic argument only
+  // holds for water carried by water at rest density; a sparse pile of beads is
+  // still because it just landed, and sparing it gravity froze it mid-heap.
+  // Sparse means little weight in the kernel, so it keeps falling and merges.
+  const support = std.saturate(weightSum / (params.restDensity * 0.6));
+
+  // And it needs the local free surface to be LEVEL. "Still means balanced" is
+  // only true of a pool whose surface is square to gravity; a heap at rest is
+  // out of equilibrium and needs its gravity to slump. Sparing heaps their
+  // gravity froze them - the tub's inflow stacked into a standing pillar that
+  // climbed the back wall instead of slumping forward. The neighbour-offset
+  // sum points out of the liquid at a free surface, so its tilt against "up"
+  // says whether this is pool or pile.
+  const upNow = simLayout.$.scene.down * -1;
+  let levelness = d.f32(1);
+  const asymmetry = std.length(outward) / std.max(weightSum * params.kernelRadius, 1e-6);
+  if (asymmetry > 0.05) {
+    const o = outward / std.max(std.length(outward), 1e-9);
+    const tilt = std.length(o - upNow * std.dot(o, upNow));
+    levelness = 1 - std.saturate((tilt - 0.6) / 0.25);
+
+    // The water's edge against a wall reads as a heap - its outward vector
+    // points sideways - so it could NEVER calm, and the contact line simmered
+    // forever: gravity pressed it at the rim, the crossing was refused, and
+    // the cycle sustained its own wakefulness. A heap flank has open air
+    // beside it; this water is RESTING on a floor. Resting contact on a
+    // floor-like surface restores its right to sleep. A pillar against a
+    // vertical wall gets nothing back - its footing has no floorness - and
+    // still slumps.
+    const seat = position.z - surfaceAt(position.xy);
+    if (seat < params.kernelRadius) {
+      const footing = std.saturate(std.dot(surfaceNormal(position.xy), upNow));
+      levelness = std.max(levelness, footing * footing);
+    }
+  }
+  // Blended two-thirds toward yesterday's answer. Without the memory, a
+  // particle at the waterline flickered between calm and awake with every
+  // wobble of its tilt estimate, and each waking re-armed gravity for a step -
+  // the last visible simmer lived exactly there.
+  const instant = (1 - std.saturate(around / CALM_SPEED)) * support * levelness;
+  const calm = std.mix(instant, simLayout.$.calms[gid.x], 0.65);
+  simLayout.$.calms[gid.x] = calm;
+  const coefficient = params.viscosity + calm * (CALM_VISCOSITY - params.viscosity);
+
   // The multiplier has done its job by now, so this pass owns the whole slot.
+  // The sleep term rides along: it is just a negative multiple of the
+  // particle's own velocity, so the relax pass applies both in one add.
+  // Calm rides in w so next substep's predict can read it - deltas are indexed
+  // by particle id, which is stable across the grid's re-sorts.
   simLayout.$.deltas[gid.x] = d.vec4f(
-    smoothed * (params.viscosity / params.restDensity),
-    0,
+    smoothed * (coefficient / params.restDensity) - velocity * (calm * calm * SLEEP_DAMP),
+    calm,
   );
 });
 
@@ -664,7 +809,11 @@ export const defaultTuning: FluidTuning = {
   surfaceFriction: 0.96,
   relaxation: 100,
   depthScale: MAX_DEPTH_SCALE,
-  surfaceShell: KERNEL_RADIUS * 6,
+  // Twelve radii, not six. Water jittering at the measured surface flips
+  // between "in contact" and "buried, snap out the front" when the shell is
+  // thin, and every snap is a teleport that finalize reads back as velocity -
+  // observed directly: thickening the shell calms the simmer.
+  surfaceShell: KERNEL_RADIUS * 12,
   storm: false,
   wind: 0,
   spoutShare: 0,
@@ -686,7 +835,6 @@ export interface Fluid {
   initAsync(): Promise<void>;
   encode(pass: TgpuComputePass): void;
   tune(next: Partial<FluidTuning>): void;
-  reset(): void;
   /** Send every particle back to the dormant pool, emptying the scene. */
   drain(): void;
   destroy(): void;
@@ -698,30 +846,24 @@ export interface Fluid {
  * volume matters: strays outside would all bin into the same edge cells and turn
  * the neighbour search quadratic.
  */
-function initialParticles(
-  emitter: readonly [number, number, number],
-  startFraction: number,
-): ArrayBuffer {
-  const active = Math.round(PARTICLE_COUNT * startFraction);
-  const columns = Math.max(1, Math.floor(0.4 / REST_SPACING));
-  const layers = Math.max(1, Math.floor((Z_MAX * 0.35) / REST_SPACING));
-  const perSlab = columns * layers;
-
+/**
+ * Every particle parked in the dormant pool, so the scene opens empty.
+ *
+ * There used to be a block of liquid placed here at load. It was dropped in at
+ * fixed coordinates with no idea what was behind it, so part of it spawned
+ * inside the scene's own geometry and stuck there - at half a million particles
+ * that is a sheet of glass hanging across the picture. Liquid now only ever
+ * enters through the spout, in open air, in front of whatever the camera sees.
+ */
+function initialParticles(emitter: readonly [number, number, number]): ArrayBuffer {
   const bytes = new ArrayBuffer(PARTICLE_COUNT * FLOATS_PER_PARTICLE * 4);
   const data = new Float32Array(bytes);
 
   for (let index = 0; index < PARTICLE_COUNT; index++) {
     const base = index * FLOATS_PER_PARTICLE;
-    let x = emitter[0];
-    let y = DORMANT_Y;
-    let z = emitter[2];
-
-    if (index < active) {
-      const withinSlab = index % perSlab;
-      x = 0.3 + (withinSlab % columns) * REST_SPACING;
-      z = Z_MAX * 0.42 + Math.floor(withinSlab / columns) * REST_SPACING;
-      y = 0.02 + Math.floor(index / perSlab) * REST_SPACING;
-    }
+    const x = emitter[0];
+    const y = DORMANT_Y;
+    const z = emitter[2];
 
     data[base] = x;
     data[base + 1] = y;
@@ -737,6 +879,7 @@ export interface FluidInputs {
   readonly surface: SingleChannelTexture;
   readonly surfacePrev: SingleChannelTexture;
   readonly surfaceLive: SingleChannelTexture;
+  readonly surfaceBack: SingleChannelTexture;
   readonly scene: TgpuBuffer<typeof SceneState> & StorageFlag;
   readonly fieldSampler: TgpuSampler;
   /** Seconds since the previous depth update, for obstacle motion. */
@@ -752,6 +895,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
   const deltas = root.createBuffer(d.arrayOf(d.vec4f, PARTICLE_COUNT)).$usage('storage');
   const params = root.createBuffer(SimParams).$usage('uniform');
   const population = root.createBuffer(d.arrayOf(d.atomic(d.u32), 1)).$usage('storage');
+  const calms = root.createBuffer(d.arrayOf(d.f32, PARTICLE_COUNT)).$usage('storage');
   const grid = createHashGrid(root, particles);
 
   const bindGroup = root.createBindGroup(simLayout, {
@@ -761,9 +905,11 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
     cellStart: grid.cellStart,
     sortedIndex: grid.sortedIndex,
     population,
+    calms,
     surface: inputs.surface.createView(),
     surfacePrev: inputs.surfacePrev.createView(),
     surfaceLive: inputs.surfaceLive.createView(),
+    surfaceBack: inputs.surfaceBack.createView(),
     scene: inputs.scene,
     fieldSampler: inputs.fieldSampler,
   });
@@ -823,7 +969,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
     });
   }
 
-  particles.write(initialParticles(emitterPosition(), START_FRACTION));
+  particles.write(initialParticles(emitterPosition()));
   writeParams();
 
   return {
@@ -860,12 +1006,8 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
       writeParams();
     },
 
-    reset() {
-      particles.write(initialParticles(emitterPosition(), START_FRACTION));
-    },
-
     drain() {
-      particles.write(initialParticles(emitterPosition(), 0));
+      particles.write(initialParticles(emitterPosition()));
     },
 
     destroy() {
@@ -874,6 +1016,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
       deltas.destroy();
       params.destroy();
       population.destroy();
+      calms.destroy();
     },
   };
 }

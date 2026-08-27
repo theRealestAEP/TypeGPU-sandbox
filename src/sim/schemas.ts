@@ -306,6 +306,14 @@ export const SmokeParams = d.struct({
   emitRate: d.f32,
   /** Heat added per second at the source. */
   emitHeat: d.f32,
+  /**
+   * Standing sources planted in the scene - a cigarette on a counter, a torch
+   * on a wall - each xyz position plus emission rate in w. Zero rate is an
+   * empty slot. Their footprint and heat ride in `propTraits`: radius in x,
+   * heat in y.
+   */
+  props: d.arrayOf(d.vec4f, 4),
+  propTraits: d.arrayOf(d.vec4f, 4),
   /** Lift per unit heat, along the measured up. */
   buoyancy: d.f32,
   /** Heat lost per second, as a rate in an exponential decay. */

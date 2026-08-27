@@ -45,32 +45,13 @@ const orientLayout = tgpu.bindGroupLayout({
 });
 
 const normalSums = tgpu.workgroupVar(d.arrayOf(d.vec3f, ORIENT_THREADS));
-const normalCounts = tgpu.workgroupVar(d.arrayOf(d.f32, ORIENT_THREADS));
+const scatterOff = tgpu.workgroupVar(d.arrayOf(d.vec3f, ORIENT_THREADS));
+const seedDown = tgpu.workgroupVar(d.vec3f);
+const driftShared = tgpu.workgroupVar(d.f32);
+const groundSums = tgpu.workgroupVar(d.arrayOf(d.f32, ORIENT_THREADS));
+const groundShare = tgpu.workgroupVar(d.f32);
 /** Per-thread advance of the surface since the last update, for the mean. */
 const driftSums = tgpu.workgroupVar(d.arrayOf(d.f32, ORIENT_THREADS));
-const firstGuess = tgpu.workgroupVar(d.vec3f);
-
-/** Second pass keeps only normals within this much of the first estimate. */
-const AGREEMENT = 0.82;
-
-/**
- * How far a surface has to lean toward the top of the image before it counts as
- * ground. This threshold is the whole difference between a working estimate and
- * a useless one. A wall facing the camera, or distant background, has a normal
- * of almost exactly (0, 0, 1) - no vertical lean at all - and a threshold near
- * zero lets depth noise push half of those texels through. They then dominate
- * the average by sheer area, and the answer comes back as "up is toward the
- * camera", which is to say gravity points into the scene and every drop of water
- * slides to the back wall. Measured on the pool photo before this: 93% of gravity
- * pointed into the scene against 38% down the image.
- */
-const GROUND_LEAN = 0.35;
-
-/**
- * Fraction of the field that has to read as ground before the measurement is
- * trusted outright. Below it the answer is blended toward a level camera.
- */
-const CONFIDENT_AREA = 0.1;
 
 /**
  * Largest z component gravity may have. A depth map cannot tell a floor seen
@@ -133,67 +114,178 @@ const surfaceNormalAt = (coord: d.v2u) => {
  */
 const ORIENTATION_SMOOTHING = 0.9;
 
+/** Multiplies the symmetric scatter matrix, held as its six unique terms. */
+const scatterTimes = (diagonal: d.v3f, offDiagonal: d.v3f, v: d.v3f) => {
+  'use gpu';
+  return d.vec3f(
+    diagonal.x * v.x + offDiagonal.x * v.y + offDiagonal.y * v.z,
+    offDiagonal.x * v.x + diagonal.y * v.y + offDiagonal.z * v.z,
+    offDiagonal.y * v.x + offDiagonal.z * v.y + diagonal.z * v.z,
+  );
+};
+
+/**
+ * Points an axis away from the camera. An axis is a line, so each has to be
+ * pointed before any of them can be compared; you pour into things, so down
+ * leads into the scene and never back out of it.
+ */
+const aimedIntoScene = (a: d.v3f) => {
+  'use gpu';
+  return std.select(a * -1, a, a.z < 0);
+};
+
+/** How closely a normal must agree with the seed to join the refit. */
+const AGREEMENT = 0.94;
+
+/**
+ * Roll this small snaps to exactly level. Cameras are held level far more often
+ * than they are held one degree off it, and a standing half-degree tilt is a
+ * standing sideways pull the whole pool slowly obeys.
+ */
+const LEVEL_SNAP = 0.045;
+
+/** Power iteration. Enough steps to separate the axes of a room. */
+const POWER_STEPS = 24;
+
+const dominantAxis = (diagonal: d.v3f, offDiagonal: d.v3f, seed: d.v3f) => {
+  'use gpu';
+  let v = d.vec3f(seed);
+  for (const _step of std.range(POWER_STEPS)) {
+    const next = scatterTimes(diagonal, offDiagonal, v);
+    const size = std.length(next);
+    if (size > 1e-12) {
+      v = next / size;
+    }
+  }
+  return v;
+};
+
+/**
+ * Which way is down, from the shape of the scene's normal distribution.
+ *
+ * The old estimator averaged every surface that leaned toward the top of the
+ * image and called the reverse of that gravity. That works looking down at a
+ * table and fails in a room, because a wall facing the camera has a normal of
+ * almost exactly (0, 0, 1) and a floor seen at a shallow angle has a normal
+ * barely distinguishable from it. Both have a small y. No threshold on y can
+ * separate them - measured on the bathroom, loosening the gate from 0.35 to
+ * 0.05 pulled the answer from 22 degrees to 26 as the tiles flooded in.
+ *
+ * What does separate them is structure. Surfaces in a built scene are not
+ * scattered; they cluster onto a handful of mutually square directions - walls,
+ * floor, counter. Fit that frame instead of averaging, and the question stops
+ * being "which texels are ground" and becomes "which of these three axes is
+ * vertical", which the image answers unambiguously: gravity is the axis that
+ * runs most steeply down the picture.
+ *
+ * The frame comes from the scatter matrix of the normals. Its dominant
+ * eigenvector is whatever surface owns the most area - in a tiled bathroom,
+ * the wall. Deflate that out and the next one appears, and the third is their
+ * cross product. No thresholds anywhere, and a scene made mostly of floor works
+ * by the same path as one made mostly of wall.
+ */
 const orientKernel = tgpu.computeFn({
   workgroupSize: [ORIENT_THREADS],
   in: { lid: d.builtin.localInvocationIndex },
 })(({ lid }) => {
   'use gpu';
-  // Pass one: the mean up-facing normal across the whole field, plus each
-  // thread's share of how far the surface advanced since the last update.
-  let sum = d.vec3f();
-  let count = d.f32(0);
+  // Every normal contributes to the scatter matrix. Six unique terms, carried
+  // as two vectors: the diagonal and the off-diagonal.
+  let diagonal = d.vec3f();
+  let offDiagonal = d.vec3f();
   let driftSum = d.f32(0);
+  let groundSum = d.f32(0);
   for (const step of std.range(ORIENT_STRIDE)) {
     const index = lid * ORIENT_STRIDE + step;
     if (index < FIELD_RES * FIELD_RES) {
-      const normal = surfaceNormalAt(d.vec2u(index % FIELD_RES, index / FIELD_RES));
-      driftSum += scaledDepthAt((d.vec2f(index % FIELD_RES, index / FIELD_RES) + 0.5) *
-        (1 / d.f32(FIELD_RES))) -
-        scaledPrevDepthAt((d.vec2f(index % FIELD_RES, index / FIELD_RES) + 0.5) *
-          (1 / d.f32(FIELD_RES)));
-      // Leaning toward the top of the image means it faces upward in the world.
-      if (normal.y < -GROUND_LEAN) {
-        sum = sum + normal;
-        count += 1;
+      const coord = d.vec2u(index % FIELD_RES, index / FIELD_RES);
+      const uv = (d.vec2f(d.f32(index % FIELD_RES), d.f32(index / FIELD_RES)) + 0.5) *
+        (1 / d.f32(FIELD_RES));
+      driftSum += scaledDepthAt(uv) - scaledPrevDepthAt(uv);
+
+      const normal = surfaceNormalAt(coord);
+      // Surfaces you could stand on lean toward the top of the image. How much
+      // of the frame they cover is the evidence that gravity is measurable at
+      // all - a webcam full of wall and face has none.
+      if (normal.y < -0.12) {
+        groundSum += 1;
       }
+      diagonal = diagonal + normal * normal;
+      offDiagonal = offDiagonal +
+        d.vec3f(normal.x * normal.y, normal.x * normal.z, normal.y * normal.z);
     }
   }
-  normalSums.$[lid] = d.vec3f(sum);
-  normalCounts.$[lid] = count;
+  normalSums.$[lid] = d.vec3f(diagonal);
+  scatterOff.$[lid] = d.vec3f(offDiagonal);
   driftSums.$[lid] = driftSum;
+  groundSums.$[lid] = groundSum;
   std.workgroupBarrier();
 
   if (lid === 0) {
-    let total = d.vec3f();
+    let diag = d.vec3f();
+    let off = d.vec3f();
+    let driftTotal = d.f32(0);
     for (const slot of std.range(ORIENT_THREADS)) {
-      total = total + normalSums.$[slot];
+      diag = diag + normalSums.$[slot];
+      off = off + scatterOff.$[slot];
+      driftTotal += driftSums.$[slot];
     }
-    let guess = d.vec3f(0, -1, 0);
-    if (std.length(total) > 0.001) {
-      guess = std.normalize(total);
+    driftShared.$ = driftTotal / d.f32(FIELD_RES * FIELD_RES);
+    let groundTotal = d.f32(0);
+    for (const slot of std.range(ORIENT_THREADS)) {
+      groundTotal += groundSums.$[slot];
     }
-    firstGuess.$ = d.vec3f(guess);
+    groundShare.$ = groundTotal / d.f32(FIELD_RES * FIELD_RES);
+
+    // The frame: biggest cluster, then the biggest of what is left, then the
+    // one square to both.
+    const first = dominantAxis(diag, off, d.vec3f(0, 0, 1));
+    const power = std.dot(first, scatterTimes(diag, off, first));
+    const deflatedDiag = diag - first * first * power;
+    const deflatedOff = off -
+      d.vec3f(first.x * first.y, first.x * first.z, first.y * first.z) * power;
+    const second = std.normalize(
+      dominantAxis(deflatedDiag, deflatedOff, d.vec3f(0, 1, 0)) -
+        first * std.dot(first, dominantAxis(deflatedDiag, deflatedOff, d.vec3f(0, 1, 0))),
+    );
+    const third = std.normalize(std.cross(first, second));
+
+    const a1 = aimedIntoScene(first);
+    const a2 = aimedIntoScene(second);
+    const a3 = aimedIntoScene(third);
+
+    // Of those, gravity is the one running most steeply down the picture.
+    let axis = d.vec3f(a1);
+    if (a2.y > axis.y) {
+      axis = d.vec3f(a2);
+    }
+    if (a3.y > axis.y) {
+      axis = d.vec3f(a3);
+    }
+    seedDown.$ = std.normalize(std.select(axis * -1, axis, axis.y > 0));
   }
   std.workgroupBarrier();
 
-  // Pass two: refit using only the surfaces that agree with that estimate. A
-  // plain mean is dragged around by whatever else is in frame - a wall, a chair -
-  // and even a few degrees of tilt leaves a standing tangential pull that slides
-  // the whole pool across a table it should be resting flat on.
+  // Refit. The frame fit says which cluster is the ground, which is the part no
+  // average could work out; averaging that cluster says precisely where it
+  // points, which is the part no single fitted axis can, because it inherits
+  // every wobble in the surface it was fitted to. On the tub that showed up as
+  // roll drifting several degrees off level. Seed from the fit, then average.
+  const seed = d.vec3f(seedDown.$);
   let agreed = d.vec3f();
   let agreedCount = d.f32(0);
   for (const step of std.range(ORIENT_STRIDE)) {
     const index = lid * ORIENT_STRIDE + step;
     if (index < FIELD_RES * FIELD_RES) {
       const normal = surfaceNormalAt(d.vec2u(index % FIELD_RES, index / FIELD_RES));
-      if (normal.y < -GROUND_LEAN && std.dot(normal, firstGuess.$) > AGREEMENT) {
+      if (std.dot(normal, seed * -1) > AGREEMENT) {
         agreed = agreed + normal;
         agreedCount += 1;
       }
     }
   }
   normalSums.$[lid] = d.vec3f(agreed);
-  normalCounts.$[lid] = agreedCount;
+  scatterOff.$[lid] = d.vec3f(agreedCount, 0, 0);
   std.workgroupBarrier();
 
   if (lid === 0) {
@@ -201,24 +293,46 @@ const orientKernel = tgpu.computeFn({
     let found = d.f32(0);
     for (const slot of std.range(ORIENT_THREADS)) {
       total = total + normalSums.$[slot];
-      found += normalCounts.$[slot];
+      found += scatterOff.$[slot].x;
     }
-    let up = d.vec3f(firstGuess.$);
-    if (found > 0 && std.length(total) > 0.001) {
-      up = std.normalize(total);
+    // The two estimates are good at different halves of the answer, so each
+    // supplies the half it is good at.
+    //
+    // Pitch comes from the frame fit, because at a shallow angle the ground and
+    // the wall behind it differ by about ten degrees of normal - closer than any
+    // cone - and only the orthogonality of the fitted frame tells them apart.
+    // Averaging cannot; it just splits the difference and reports the camera as
+    // steeper than it is.
+    //
+    // Roll comes from averaging the ground cluster, because a single fitted axis
+    // carries every wobble of the surface it was fitted to, and on the tub that
+    // showed up as four degrees of tilt on a level shot.
+    const seeded = d.vec3f(seedDown.$);
+    let down = d.vec3f(seeded);
+    if (found > 32 && std.length(total) > 0.001) {
+      const refined = std.normalize(std.normalize(total) * -1);
+      const pitch = std.asin(std.clamp(-seeded.z, -1, 1));
+      let roll = std.atan2(refined.x, std.max(refined.y, 1e-4));
+      if (std.abs(roll) < LEVEL_SNAP) {
+        roll = 0;
+      }
+      const flat = std.cos(pitch);
+      down = std.normalize(
+        d.vec3f(std.sin(roll) * flat, std.cos(roll) * flat, -std.sin(pitch)),
+      );
     }
 
-    // A camera is level far more often than not, so that is the starting
-    // assumption, and the measurement only moves it as far as the evidence
-    // supports. With no ground in frame - a webcam pointed across a room at a
-    // person, say - there is nothing to measure and the level answer stands,
-    // which is right, instead of the average of a wall.
-    const area = found / d.f32(FIELD_RES * FIELD_RES);
-    const confidence = std.saturate(area / d.f32(CONFIDENT_AREA));
-    let down = std.normalize(std.mix(d.vec3f(0, 1, 0), up * -1, confidence));
+    // Steepness has to be earned. The frame fit always produces SOME axis,
+    // and on a scene with no visible ground - a webcam full of face and wall -
+    // that axis is fitted noise, which once read as 68 degrees into the scene
+    // with 53 of roll on a level laptop camera. A camera is level far more
+    // often than not, so that is the prior, and the measurement only moves it
+    // as far as the visible ground area supports.
+    const confidence = std.saturate((groundShare.$ - 0.02) / 0.06);
+    down = std.normalize(std.mix(d.vec3f(0, 1, 0), down, confidence));
 
-    // Cap the lean into the scene. Beyond this the estimate is more likely to be
-    // a wall mistaken for a floor than a genuinely overhead camera.
+    // Cap the lean into the scene. Past this the fit is more likely to have
+    // locked onto a wall than onto genuinely overhead geometry.
     if (std.abs(down.z) > MAX_INTO_SCENE) {
       const flat = std.length(down.xy);
       const keep = std.sqrt(1 - MAX_INTO_SCENE * MAX_INTO_SCENE);
@@ -230,34 +344,18 @@ const orientKernel = tgpu.computeFn({
       }
     }
 
-    // Blend with the last published estimate before writing back. The buffer
-    // is both the source and the destination: an EMA whose state lives where
-    // everyone downstream reads it. Without the blend the floor plane twitched
-    // every time the scene moved; with it, water holds still while the
-    // estimate tracks genuinely new geometry within about a second.
+    // Blend with the last published estimate. The buffer is both source and
+    // destination: an EMA whose state lives where everyone downstream reads it.
     const previous = d.vec3f(orientLayout.$.scene.down);
     down = std.normalize(
       down * (1 - ORIENTATION_SMOOTHING) + previous * ORIENTATION_SMOOTHING,
     );
 
-    // A pinned direction wins outright. No blend: the whole point is that the
-    // scene stops arguing about it.
     if (orientLayout.$.params.manual !== 0) {
       down = std.normalize(orientLayout.$.params.manualDown);
     }
-
     orientLayout.$.scene.down = d.vec3f(down);
-
-    // Mean forward advance of the whole surface this update. Monocular depth
-    // renormalises its range whenever the scene's content shifts, so static
-    // geometry registers phantom motion; subtracting the field-wide mean in
-    // the fluid keeps obstacle contacts honest while real local motion - a
-    // descending paw, a hand over the spout - still counts.
-    let driftTotal = d.f32(0);
-    for (const slot of std.range(ORIENT_THREADS)) {
-      driftTotal += driftSums.$[slot];
-    }
-    orientLayout.$.scene.drift = driftTotal / d.f32(FIELD_RES * FIELD_RES);
+    orientLayout.$.scene.drift = driftShared.$;
   }
 });
 
@@ -303,6 +401,8 @@ export interface SurfaceField {
    * faster, so this is what the fluid actually collides against.
    */
   readonly live: SingleChannelTexture;
+  /** The scene with transient occluders forgotten; what stands behind a hand. */
+  readonly background: SingleChannelTexture;
   initAsync(): Promise<void>;
   encode(pass: TgpuComputePass): void;
   /** Re-walks `live` for the current point in the depth interval. Every frame. */
@@ -332,6 +432,7 @@ export function createSurfaceField(
   const surface = createFieldTexture(root, FIELD_RES);
   const surfacePrev = createFieldTexture(root, FIELD_RES);
   const live = createFieldTexture(root, FIELD_RES);
+  const background = createFieldTexture(root, FIELD_RES);
 
   const filter = createSurfaceFilter(root, {
     resolution: FIELD_RES,
@@ -377,6 +478,50 @@ export function createSurfaceField(
   const holdGroups = Math.ceil(FIELD_RES / 8);
 
   /**
+   * The scene as it stands when nothing is passing in front of it.
+   *
+   * A heightfield only knows the front-most surface, so a hand crossing a sink
+   * REPLACES the sink at those texels, and the water beneath instantly loses
+   * its floor. The background layer remembers: anything revealed - the live
+   * surface at or deeper than what is stored - is adopted at once, while a
+   * nearer arrival has to persist for a couple of seconds before it counts as
+   * scenery. A passing hand never qualifies; a cup set down does.
+   */
+  const backLayout = tgpu.bindGroupLayout({
+    liveIn: { texture: d.texture2d(d.f32) },
+    backIn: { texture: d.texture2d(d.f32) },
+    target: { storageTexture: d.textureStorage2d('rgba16float', 'write-only') },
+  });
+  const backKernel = tgpu.computeFn({
+    workgroupSize: [8, 8],
+    in: { gid: d.builtin.globalInvocationId },
+  })(({ gid }) => {
+    'use gpu';
+    if (gid.x >= d.u32(FIELD_RES) || gid.y >= d.u32(FIELD_RES)) {
+      return;
+    }
+    const now = std.textureLoad(backLayout.$.liveIn, gid.xy, 0).x;
+    const held = std.textureLoad(backLayout.$.backIn, gid.xy, 0).x;
+    let next = std.mix(held, now, 0.03);
+    if (now <= held + 0.004 || held < 0.02) {
+      next = now;
+    }
+    std.textureStore(backLayout.$.target, gid.xy, d.vec4f(next, 1, 0, 1));
+  });
+  // Ping-pong through the free scratch texture: read background, write scratch,
+  // then the copy below publishes scratch back.
+  const backStep = root.createBindGroup(backLayout, {
+    liveIn: surface.createView(),
+    backIn: background.createView(),
+    target: scratch.createView(d.textureStorage2d('rgba16float', 'write-only')),
+  });
+  const backPublish = root.createBindGroup(holdLayout, {
+    source: scratch.createView(),
+    target: background.createView(d.textureStorage2d('rgba16float', 'write-only')),
+  });
+  const backPipe = root.createComputePipeline({ compute: backKernel });
+
+  /**
    * Walks the collision surface from the previous measurement to the newest one
    * across the depth interval, so the wall travels at the speed it was measured
    * at instead of teleporting on the frame the depth lands.
@@ -418,6 +563,7 @@ export function createSurfaceField(
     surfacePrev,
     scene,
     live,
+    background,
 
     async initAsync() {
       await Promise.all([
@@ -436,6 +582,8 @@ export function createSurfaceField(
     encode(pass) {
       hold.with(pass).with(holdBindGroup).dispatchWorkgroups(holdGroups, holdGroups);
       filter.encode(pass);
+      backPipe.with(pass).with(backStep).dispatchWorkgroups(holdGroups, holdGroups);
+      hold.with(pass).with(backPublish).dispatchWorkgroups(holdGroups, holdGroups);
       orient.with(pass).with(orientBindGroup).dispatchWorkgroups(1);
     },
 
@@ -456,6 +604,7 @@ export function createSurfaceField(
       surface.destroy();
       surfacePrev.destroy();
       live.destroy();
+      background.destroy();
       phase.destroy();
     },
   };

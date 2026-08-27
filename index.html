@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Liquid in a Cup</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22><text y=%2213%22 font-size=%2213%22>💧</text></svg>" />
     <style>
       /*
         The picture is the product; the controls are the console around it.
@@ -33,6 +34,10 @@
         --plate: min(100vh, 100vw);
       }
       * { box-sizing: border-box; }
+      /* The hidden attribute must always win. The tool filter sets it on
+         drawer groups whose own display:flex was quietly overriding the UA's
+         [hidden] rule - so every tool showed every setting. */
+      [hidden] { display: none !important; }
       html, body { height: 100%; }
       body {
         margin: 0;
@@ -182,6 +187,19 @@
       }
       #status[data-tone="error"] { color: var(--alert); }
 
+      /* Fingertip control: an input method, not a tool, so it lives with the
+         readouts rather than in the tool bar. Only where there is video. */
+      #handToggle,
+      #faceFilters {
+        margin-top: .75rem;
+        border: 1px solid var(--edge);
+      }
+      #faceFilters { margin-left: .35rem; }
+      #handToggle[aria-pressed="true"] {
+        color: var(--signal);
+        background: var(--signal-dim);
+      }
+
       /* ---------- console rails ---------- */
       .rail {
         position: fixed;
@@ -258,6 +276,16 @@
       }
       .scenario[aria-pressed="true"] small { color: var(--signal); }
 
+      /* Source lives with the scenarios: choosing where the picture comes from
+         is picking a subject, not firing an action. */
+      .sources { flex-wrap: wrap; gap: .1rem; padding: 0 .35rem .1rem; }
+      button.wide {
+        width: calc(100% - .7rem);
+        margin: .1rem .35rem .45rem;
+        justify-content: space-between;
+        border: 1px solid var(--edge);
+      }
+
       /* ---------- controls ---------- */
       .cluster {
         display: flex;
@@ -330,6 +358,20 @@
       }
       #pour[aria-pressed="true"] kbd { color: rgba(7, 9, 11, .7); background: rgba(7, 9, 11, .14); }
 
+      /* Which object the Objects tool plants. Only there when it matters. */
+      #propKind {
+        display: none;
+        font: inherit;
+        font-size: .72rem;
+        color: var(--signal);
+        background: var(--signal-dim);
+        border: 0;
+        border-radius: 3px;
+        padding: .34rem .4rem;
+        cursor: pointer;
+      }
+      body[data-tool="props"] #propKind { display: inline-block; }
+
       /* ---------- fill: a level gauge against the plate ----------
          How full the scene is, is a level. Drawn as one - a column standing
          beside the picture at the height the liquid has reached - it says the
@@ -397,6 +439,106 @@
         color: var(--text-faint);
       }
 
+      /* ---------- gravity probe ----------
+         Which way the scene thinks down is, drawn on the scene. Shown while the
+         tuning drawer is open, because that is when you are arguing with it. */
+      .gravity {
+        position: fixed;
+        z-index: 2;
+        top: 50%;
+        left: 50%;
+        width: 0;
+        height: 0;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity .2s, transform .28s cubic-bezier(.4, 0, .2, 1);
+      }
+      body:has(#tune[data-open="true"]) .gravity { opacity: 1; }
+      body:has(#tune[data-open="true"]) .gravity {
+        transform: translateX(calc(-1 * min(9.5rem, 8vw)));
+      }
+      /* The point the vector is measured from. */
+      .gravity::before {
+        content: "";
+        position: absolute;
+        left: -3px;
+        top: -3px;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        border: 1px solid var(--signal);
+      }
+      .gravity-arrow {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 1px;
+        height: var(--len, 5rem);
+        background: var(--signal);
+        transform-origin: 0 0;
+        transform: rotate(var(--roll, 0deg));
+        box-shadow: 0 0 8px -1px var(--signal);
+      }
+      .gravity-arrow::after {
+        content: "";
+        position: absolute;
+        left: -3px;
+        bottom: -1px;
+        border-left: 3.5px solid transparent;
+        border-right: 3.5px solid transparent;
+        border-top: 7px solid var(--signal);
+      }
+      /* The part of down that runs into the picture has no length on screen, so
+         it is written rather than drawn. */
+      .gravity-note {
+        position: absolute;
+        left: .7rem;
+        top: .4rem;
+        font-family: var(--mono);
+        font-size: .62rem;
+        letter-spacing: .06em;
+        color: var(--signal);
+        white-space: nowrap;
+        text-shadow: 0 1px 8px rgba(0, 0, 0, .95);
+      }
+
+      /* ---------- vessel probe ----------
+         Everything the scene could hold liquid in, outlined with how deep it
+         can fill. Shown with the drawer, like the gravity probe: both answer
+         "what does the app believe about this picture". */
+      .vessels {
+        position: fixed;
+        z-index: 2;
+        top: 50%;
+        left: 50%;
+        width: var(--plate);
+        height: var(--plate);
+        transform: translate(-50%, -50%);
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity .2s, transform .28s cubic-bezier(.4, 0, .2, 1);
+      }
+      body:has(#tune[data-open="true"]) .vessels {
+        opacity: 1;
+        transform: translate(calc(-50% - min(9.5rem, 8vw)), -50%);
+      }
+      .vessel {
+        position: absolute;
+        border: 1px solid rgba(242, 166, 90, .6);
+        border-radius: 2px;
+      }
+      .vessel span {
+        position: absolute;
+        left: -1px;
+        top: -1.1rem;
+        font-family: var(--mono);
+        font-size: .56rem;
+        letter-spacing: .08em;
+        color: var(--signal);
+        white-space: nowrap;
+        text-shadow: 0 1px 8px rgba(0, 0, 0, .95);
+      }
+
       /* ---------- tuning ---------- */
       #tune {
         position: fixed;
@@ -451,6 +593,18 @@
       #tuneBody { display: flex; flex-direction: column; gap: 1.4rem; }
 
       .group { display: flex; flex-direction: column; gap: .55rem; }
+      .plumbing { display: flex; flex-direction: column; gap: 1.4rem; }
+      .plumbing summary {
+        cursor: pointer;
+        list-style: none;
+        font-family: var(--mono);
+        font-size: .58rem;
+        letter-spacing: .22em;
+        text-transform: uppercase;
+        color: var(--text-faint);
+      }
+      .plumbing summary::before { content: "+ "; }
+      .plumbing[open] summary::before { content: "\2212  "; }
       .group > h3 {
         margin: 0 0 .2rem;
         font-family: var(--mono);
@@ -547,7 +701,7 @@
     </style>
   </head>
   <body>
-    <div id="stage"><canvas></canvas><div id="spout" aria-hidden="true"></div></div>
+    <div id="stage"><canvas></canvas><div id="spout" aria-hidden="true" hidden></div></div>
     <div id="vignette"></div>
     <video playsinline muted></video>
     <input id="picker" type="file" accept="image/*,video/*" hidden />
@@ -556,6 +710,8 @@
       <h1>Liquid<span>.</span></h1>
       <p id="status">Starting…</p>
       <p id="hint">Hold to pour. Scroll to set the spout's depth. Drop in an image or video.</p>
+      <button id="handToggle" aria-pressed="true" hidden>Hand control <kbd>H</kbd></button>
+      <button id="faceFilters" hidden>Face filters&hellip;</button>
     </header>
 
     <div class="gauge" aria-hidden="true">
@@ -565,10 +721,20 @@
       <span class="label">Fill</span>
     </div>
 
+    <div class="vessels" id="vessels" aria-hidden="true"></div>
+
+    <div class="gravity" aria-hidden="true">
+      <span class="gravity-arrow" id="gravityArrow"></span>
+      <span class="gravity-note" id="gravityNote">down</span>
+    </div>
+
     <aside class="rail rail-l">
       <div class="surface">
         <p class="eyebrow" style="padding:.55rem .6rem 0;margin-bottom:.35rem">Scenarios</p>
         <div id="scenarios"></div>
+        <p class="eyebrow" style="padding:.7rem .6rem 0;margin-bottom:.3rem">Source</p>
+        <div class="cluster sources" id="scenes"></div>
+        <button id="open" class="wide">Open a file <kbd>O</kbd></button>
       </div>
     </aside>
 
@@ -577,13 +743,11 @@
     </nav>
 
     <div class="bar glass">
-      <div class="cluster" id="scenes" style="padding:0"></div>
-      <button id="open">Open <kbd>O</kbd></button>
       <button id="pour" aria-pressed="false">Hold <kbd>space</kbd></button>
       <button id="storm" aria-pressed="false">Storm <kbd>S</kbd></button>
       <div class="cluster" id="media" style="padding:0"></div>
-      <button id="drain">Drain <kbd>D</kbd></button>
-      <button id="reset">Refill <kbd>R</kbd></button>
+      <select id="propKind" aria-label="object to place"></select>
+      <button id="drain">Reset <kbd>D</kbd></button>
       <button id="tuneToggle">Tune <kbd>T</kbd></button>
     </div>
 

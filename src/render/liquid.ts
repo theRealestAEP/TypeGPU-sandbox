@@ -106,8 +106,52 @@ const LookParams = d.struct({
    */
   torch: d.f32,
   torchAt: d.vec3f,
+  /**
+   * Lamps the user has planted. Position and power in one array, colour and
+   * size in the other; power zero means the slot is empty. They light the
+   * scene itself as well as the liquid, which is what makes them read as
+   * objects in the room rather than stickers on the glass.
+   */
+  lightsA: d.arrayOf(d.vec4f, 8),
+  lightsB: d.arrayOf(d.vec4f, 8),
+  /** The spout, drawn as a small lit sphere so its place in depth is legible. */
+  spout: d.vec4f,
+  /** Glowing glasses on a tracked face: lens centres, then colour + power. */
+  glassesA: d.vec4f,
+  glassesB: d.vec4f,
   debug: d.u32,
 });
+
+/** Normal of the scene surface, for lighting the photo itself. */
+const sceneNormalAt = (uv: d.v2f) => {
+  'use gpu';
+  const step = d.f32(2 / SURFACE_RES);
+  const slope = d.vec2f(
+    sceneAt(uv + d.vec2f(step, 0)) - sceneAt(uv - d.vec2f(step, 0)),
+    sceneAt(uv + d.vec2f(0, step)) - sceneAt(uv - d.vec2f(0, step)),
+  ) / (2 * step);
+  return std.normalize(d.vec3f(slope * -1, 1));
+};
+
+/**
+ * What one planted lamp adds to a point with the given normal. Inverse-square
+ * over the lamp's own size, so a small lamp is a candle and a large one is a
+ * ceiling bulb.
+ */
+const lampLight = (
+  lampAt: d.v3f,
+  power: number,
+  tint: d.v3f,
+  size: number,
+  point: d.v3f,
+  normal: d.v3f,
+) => {
+  'use gpu';
+  const toLamp = lampAt - point;
+  const reach = std.max(std.length(toLamp), 1e-4);
+  const fall = power / (1 + (reach * reach) / std.max(size * size, 1e-4));
+  return tint * (fall * std.saturate(std.dot(normal, toLamp / reach)));
+};
 
 const splatLayout = tgpu.bindGroupLayout({
   splat: { uniform: SplatParams },
@@ -127,6 +171,8 @@ const compositeLayout = tgpu.bindGroupLayout({
   fluid: { texture: d.texture2d(d.f32) },
   /** Unfiltered surface, so the composite can see how broken up it is. */
   rawFluid: { texture: d.texture2d(d.f32) },
+  /** The scene with passing occluders forgotten; where lamps actually hang. */
+  sceneBack: { texture: d.texture2d(d.f32) },
   thickness: { texture: d.texture2d(d.f32) },
   scene: { texture: d.texture2d(d.f32) },
   /** Ray-marched smoke, premultiplied colour in rgb and coverage in a. */
@@ -197,6 +243,79 @@ const splatThicknessFragment = tgpu.fragmentFn({
   return d.vec4f(falloff * falloff * falloff, 0, 0, 1);
 });
 
+/**
+ * Temporal accumulation of the filtered surface.
+ *
+ * The solver leaves a residual jitter of well under a millimetre per step. The
+ * body of the water does not care - thickness is additive, so the BODY view is
+ * glass smooth - but the surface pass keeps whichever particle is nearest per
+ * texel, and jitter re-decides that election every frame. The reconstructed
+ * surface twitches, and every term derived from it - normals, glints, caustics,
+ * foam - twitches with it. That is the boiling, and it is a rendering artefact:
+ * the liquid underneath is still.
+ *
+ * The fix is the standard one for screen-space fluids: blend each frame's
+ * filtered surface toward the last presented one, hard when the surface is
+ * nearly unchanged (settled water), not at all when it moves a real distance
+ * (a splash must not ghost). The blend is per-texel, so a pour landing in a
+ * still pool ripples where it lands and stays calm elsewhere.
+ */
+const TEMPORAL_BLEND = 0.88;
+
+const temporalLayout = tgpu.bindGroupLayout({
+  current: { texture: d.texture2d(d.f32) },
+  history: { texture: d.texture2d(d.f32) },
+  target: { storageTexture: d.textureStorage2d('rgba16float', 'write-only') },
+});
+
+const temporalKernel = tgpu.computeFn({
+  workgroupSize: [8, 8],
+  in: { gid: d.builtin.globalInvocationId },
+})(({ gid }) => {
+  'use gpu';
+  if (gid.x >= d.u32(SURFACE_RES) || gid.y >= d.u32(SURFACE_RES)) {
+    return;
+  }
+  const current = std.textureLoad(temporalLayout.$.current, gid.xy, 0);
+  const previous = std.textureLoad(temporalLayout.$.history, gid.xy, 0);
+
+  // The whole texel blends, coverage included, and there is deliberately no
+  // gate of any kind. Two gates were tried and each one released exactly where
+  // it was needed most. A motion gate let go whenever jitter flipped which
+  // particle was nearest, because that flip steps the surface by a whole bead
+  // height and per-frame motion cannot tell it from a wave. A coverage gate
+  // then pinned the body but left the waterline boiling, because the free
+  // surface is precisely where particles pop in and out of the splat election
+  // and coverage itself flickers. Blending coverage means an arriving or
+  // leaving edge fades over a few frames instead of cutting - masked by its
+  // own low alpha, and honestly closer to how a meniscus moves anyway.
+  std.textureStore(
+    temporalLayout.$.target,
+    gid.xy,
+    std.mix(current, previous, d.f32(TEMPORAL_BLEND)),
+  );
+});
+
+/** Publishes the blended surface back to both the live and history textures. */
+const publishLayout = tgpu.bindGroupLayout({
+  source: { texture: d.texture2d(d.f32) },
+  live: { storageTexture: d.textureStorage2d('rgba16float', 'write-only') },
+  keep: { storageTexture: d.textureStorage2d('rgba16float', 'write-only') },
+});
+
+const publishKernel = tgpu.computeFn({
+  workgroupSize: [8, 8],
+  in: { gid: d.builtin.globalInvocationId },
+})(({ gid }) => {
+  'use gpu';
+  if (gid.x >= d.u32(SURFACE_RES) || gid.y >= d.u32(SURFACE_RES)) {
+    return;
+  }
+  const value = std.textureLoad(publishLayout.$.source, gid.xy, 0);
+  std.textureStore(publishLayout.$.live, gid.xy, value);
+  std.textureStore(publishLayout.$.keep, gid.xy, value);
+});
+
 /** Filtered surface nearness. Channel layout is (depth, coverage). */
 const fluidAt = (uv: d.v2f) => {
   'use gpu';
@@ -206,6 +325,14 @@ const fluidAt = (uv: d.v2f) => {
 const coverageAt = (uv: d.v2f) => {
   'use gpu';
   return std.textureSample(compositeLayout.$.fluid, compositeLayout.$.linear, uv).y;
+};
+
+const sceneBackAt = (uv: d.v2f) => {
+  'use gpu';
+  return (
+    std.textureSample(compositeLayout.$.sceneBack, compositeLayout.$.linear, uv).x *
+    compositeLayout.$.field.depthScale
+  );
 };
 
 const sceneAt = (uv: d.v2f) => {
@@ -285,6 +412,19 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
   const slope = d.vec2f(right - left, below - above) / (2 * step);
   const normal = std.normalize(d.vec3f(slope * -look.relief, 1));
 
+  // Highlights get their own, wider normal. A specular lobe raised to the
+  // 200th power turns sub-pixel normal wobble - invisible in refraction - into
+  // visible sparkle flicker; measured on a settled tub, specular and caustics
+  // were HALF the remaining frame-to-frame churn. Sampling the slope over a
+  // wider stencil for the shiny terms only keeps the crisp refraction detail
+  // and calms the glints.
+  const wideStep = d.f32(5 / SURFACE_RES);
+  const wideSlope = d.vec2f(
+    fluidAt(uv + d.vec2f(wideStep, 0)) - fluidAt(uv - d.vec2f(wideStep, 0)),
+    fluidAt(uv + d.vec2f(0, wideStep)) - fluidAt(uv - d.vec2f(0, wideStep)),
+  ) / (2 * wideStep);
+  const glossNormal = std.normalize(d.vec3f(wideSlope * -look.relief, 1));
+
   // A real view ray, even though the simulation is orthographic.
   const toEye = std.normalize(d.vec3f((d.vec2f(0.5) - uv), look.lens));
   const incident = toEye * -1;
@@ -318,7 +458,48 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
   // once it had already landed and pooled.
   const body = 1 - std.exp(-optical * BODY_DENSITY);
   const visible = alpha * body * (1 - hidden);
-  const plain = backdropAt(uv);
+  let plain = backdropAt(uv);
+  // Planted lamps fall on the photo itself. This is most of the light demo:
+  // the room brightens where the lamp is, dims with distance, and shades with
+  // the scene's own measured geometry.
+  const scenePoint = d.vec3f(uv, sceneZ);
+  const sceneNormal = sceneNormalAt(uv);
+  let sceneGlow = d.vec3f();
+  for (const slot of std.range(8)) {
+    const a = look.lightsA[slot];
+    if (a.w > 0.001) {
+      const b = look.lightsB[slot];
+      // The lamp sits at the depth it was placed at (the scroll wheel), with
+      // the remembered scene as a floor - never behind the wall it was clicked
+      // on, and never remounted onto a hand passing in front. When the live
+      // surface stands nearer than the lamp, the lamp is behind it, so its
+      // light dims instead of shining through.
+      const hungZ = std.max(a.z, sceneBackAt(a.xy) + 0.06);
+      const hung = d.vec3f(a.xy, hungZ);
+      let open = d.f32(1);
+      if (sceneAt(a.xy) > hungZ + 0.06) {
+        open = 0.12;
+      }
+      sceneGlow = sceneGlow +
+        lampLight(hung, a.w * open, b.xyz, b.w, scenePoint, sceneNormal);
+    }
+  }
+  if (look.torch > 0.001) {
+    sceneGlow = sceneGlow +
+      lampLight(look.torchAt, look.torch, d.vec3f(1, 0.6, 0.26), 0.14, scenePoint, sceneNormal);
+  }
+  // Light-up glasses cast onto the face and the room like two small lamps.
+  if (look.glassesB.w > 0.001) {
+    const lensL = look.glassesA.xy;
+    const lensR = look.glassesA.zw;
+    sceneGlow = sceneGlow +
+      lampLight(d.vec3f(lensL, sceneAt(lensL) + 0.05), look.glassesB.w * 0.7, look.glassesB.xyz, 0.09, scenePoint, sceneNormal) +
+      lampLight(d.vec3f(lensR, sceneAt(lensR) + 0.05), look.glassesB.w * 0.7, look.glassesB.xyz, 0.09, scenePoint, sceneNormal);
+  }
+  // Compressed so a bright lamp saturates toward its own colour instead of
+  // clipping the tile to paper white.
+  const glowTone = sceneGlow / (d.vec3f(1) + sceneGlow * 0.55);
+  plain = plain * (1 + glowTone * 1.4) + glowTone * 0.05;
 
   // Refraction through a real interface rather than a nudge along the normal.
   // Sampled per channel with slightly different indices - dispersion. Real
@@ -339,15 +520,22 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
   // measured on a deliberately wide stencil - at the two-texel spacing used for
   // normals it just picks out the bump of each individual particle and lays a
   // filigree over the whole pool.
-  const wide = d.f32(7 / SURFACE_RES);
-  const curvature = std.abs(
-    fluidAt(uv + d.vec2f(wide, 0)) +
-      fluidAt(uv - d.vec2f(wide, 0)) +
-      fluidAt(uv + d.vec2f(0, wide)) +
-      fluidAt(uv - d.vec2f(0, wide)) -
-      fluidZ * 4,
+  const wide = d.f32(11 / SURFACE_RES);
+  // The dead zone keeps residual surface noise from twinkling the caustic
+  // lines on and off; real ripples curve far harder than the floor here.
+  const curvature = std.max(
+    std.abs(
+      fluidAt(uv + d.vec2f(wide, 0)) +
+        fluidAt(uv - d.vec2f(wide, 0)) +
+        fluidAt(uv + d.vec2f(0, wide)) +
+        fluidAt(uv - d.vec2f(0, wide)) -
+        fluidZ * 4,
+    ) - 0.012,
+    0,
   );
-  const focus = 1 + std.saturate(curvature * (look.caustics * 200)) * thickness;
+  // Gain divided so the term stops living at saturation, where any noise
+  // crossing the threshold rerolls the whole pattern every frame.
+  const focus = 1 + std.saturate(curvature * (look.caustics * 70)) * thickness;
 
   // Beer-Lambert: the further light travels through the liquid, the more of
   // everything but the tint colour is absorbed.
@@ -360,7 +548,7 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
   const scattered = look.tint * (look.scatter * thickness);
 
   // Reflection, approximated by walking the scene image along the bounce.
-  const bounce = std.reflect(incident, normal);
+  const bounce = std.reflect(incident, glossNormal);
   const mirrored = backdropAt(uv + bounce.xy * look.reflection);
 
   // Schlick. This ratio - clear straight on, mirror at a glance - is most of
@@ -371,7 +559,7 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
   // the overall curvature reads as a wet surface; one lobe alone reads as
   // plastic or as nothing at all.
   const glint = std.pow(std.saturate(std.dot(bounce, look.sun)), 220) * look.specular;
-  const sheen = std.pow(std.saturate(std.dot(normal, std.normalize(look.sun + toEye))), 48) *
+  const sheen = std.pow(std.saturate(std.dot(glossNormal, std.normalize(look.sun + toEye))), 48) *
     look.specular * 0.25;
   const sparkle = std.pow(
     std.saturate(std.dot(bounce, look.sun)),
@@ -399,8 +587,14 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
     // them white. Invisible before, because those droplets were culled anyway.
     const aerated =
       std.smoothstep(0.2, 0.6, optical) * (1 - std.smoothstep(0.8, 1.8, optical));
+    // Below the floor, a raw-vs-filtered gap is solver jitter, not aeration.
+    // The residual jitter re-rolls the raw buffer every frame, and multiplied
+    // by the foam gain it painted flickering white speckle across settled
+    // water - the boiling. A genuinely broken surface gaps by several kernel
+    // radii, so the floor costs real whitewater nothing.
+    const gap = std.max(std.abs(raw.x - fluidZ) - d.f32(KERNEL_RADIUS) * 1.2, 0);
     churn =
-      std.saturate(std.abs(raw.x - fluidZ) * look.foam) *
+      std.saturate(gap * look.foam) *
       aerated *
       std.smoothstep(0.35, 0.8, coverage);
   }
@@ -415,9 +609,26 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
     (std.saturate(std.dot(normal, torchDir)) * 0.9 +
       std.pow(std.saturate(std.dot(bounce, torchDir)), 90) * 0.6);
 
+  // Planted lamps land on the water too, at the same hung positions.
+  let lampLit = d.vec3f();
+  const waterPoint = d.vec3f(uv, fluidZ);
+  for (const slot of std.range(8)) {
+    const a = look.lightsA[slot];
+    if (a.w > 0.001) {
+      const b = look.lightsB[slot];
+      const hungZ = std.max(a.z, sceneBackAt(a.xy) + 0.06);
+      let open = d.f32(1);
+      if (sceneAt(a.xy) > hungZ + 0.06) {
+        open = 0.12;
+      }
+      lampLit = lampLit +
+        lampLight(d.vec3f(a.xy, hungZ), a.w * open, b.xyz, b.w, waterPoint, normal);
+    }
+  }
+
   const water = std.mix(transmitted + scattered, mirrored, fresnel);
   const lit = std.mix(water, d.vec3f(0.92, 0.95, 0.97), churn) +
-    d.vec3f(glint + sheen + sparkle) + torchLit;
+    d.vec3f(glint + sheen + sparkle) + torchLit + lampLit * 0.6;
 
   // Depth-graded light. The scene is lit from the camera's side, so water far
   // back sits further from every source and under more atmosphere: dimmer,
@@ -438,6 +649,96 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
   // bending it. They share the liquid's depth buffer, which is what makes a duck
   // half under the surface look half under the surface: the same nearest-wins
   // test decides water-in-front from object-in-front, per texel.
+
+  // The glasses themselves: two glowing rings and a bridge, drawn on the face
+  // before the smoke composites, so what stands in front still covers them.
+  if (look.glassesB.w > 0.001) {
+    const lensL = look.glassesA.xy;
+    const lensR = look.glassesA.zw;
+    const span = std.max(std.length(lensR - lensL), 1e-4);
+    const lensSize = std.clamp(span * 0.32, 0.012, 0.06);
+    const ringL = std.abs(std.length(uv - lensL) - lensSize);
+    const ringR = std.abs(std.length(uv - lensR) - lensSize);
+    const ring = std.min(ringL, ringR);
+    const axis = (lensR - lensL) / span;
+    const along = std.clamp(std.dot(uv - lensL, axis), 0, span);
+    const bridge = std.length(uv - (lensL + axis * along));
+    const glowLine = std.min(ring, std.max(bridge - lensSize * 0.15, 0));
+    const shine = std.exp(-std.max(glowLine, 0) / 0.004) * look.glassesB.w;
+    colour = colour + look.glassesB.xyz * shine;
+  }
+
+  // Every placed lamp gets a body: a small emissive orb at the depth it hangs,
+  // occluded by whatever stands nearer, so its place in the room is readable
+  // even before its glow lands anywhere.
+  for (const slot of std.range(8)) {
+    const a = look.lightsA[slot];
+    if (a.w > 0.001) {
+      const orbAt = d.vec2f(a.x, a.y);
+      const orbSpan = std.length(uv - orbAt);
+      const orbSize = d.f32(0.007);
+      if (orbSpan < orbSize * 2.4) {
+        const b = look.lightsB[slot];
+        // Explicit-level samples: this branch is per-pixel, and implicit
+        // derivatives are not allowed in non-uniform control flow.
+        const backHere = std.textureSampleLevel(
+          compositeLayout.$.sceneBack, compositeLayout.$.linear, orbAt, 0,
+        ).x * compositeLayout.$.field.depthScale;
+        const liveHere = std.textureSampleLevel(
+          compositeLayout.$.scene, compositeLayout.$.linear, orbAt, 0,
+        ).x * compositeLayout.$.field.depthScale;
+        const orbZ = std.max(a.z, backHere + 0.06);
+        const core = std.exp(-(orbSpan * orbSpan) / (orbSize * orbSize * 0.55));
+        let solidity = std.saturate(core * 2) * std.min(a.w, 1.2);
+        if (liveHere > orbZ + 0.05) {
+          solidity *= 0.15;
+        }
+        const body = std.mix(b.xyz, d.vec3f(1), core * 0.55);
+        colour = std.mix(colour, body, std.min(solidity, 0.95));
+      }
+    }
+  }
+
+  // The spout, drawn as a small solid sphere at its true position and depth.
+  // A flat ring said where the spout was in the image; a sphere that shades
+  // with the measured light, shrinks with distance, and slides behind whatever
+  // stands nearer says where it is in the room, which is the part that was
+  // impossible to read. When it is hidden it stays as a faint ghost, so it can
+  // be found without un-hiding it.
+  let spoutAt = look.spout.xyz;
+  // The light tool's marker sits where the lamp actually hangs - the same
+  // depth rule as the glow - not at the raw spout depth, which floats in
+  // front of the whole scene and lies about where the light is.
+  if (std.abs(look.spout.w - 0.8) < 0.01) {
+    spoutAt = d.vec3f(
+      spoutAt.xy,
+      std.max(spoutAt.z, sceneBackAt(spoutAt.xy) + 0.06),
+    );
+  }
+  const spoutOffset = uv - spoutAt.xy;
+  const spoutSize = d.f32(0.011) + spoutAt.z * 0.012;
+  const spoutRadial = std.length(spoutOffset) / spoutSize;
+  if (spoutRadial < 1) {
+    const bulge = std.sqrt(std.max(1 - spoutRadial * spoutRadial, 0));
+    const front = spoutAt.z + bulge * spoutSize;
+    const ballNormal = std.normalize(d.vec3f(spoutOffset / spoutSize, bulge));
+    const lit = std.saturate(std.dot(ballNormal, look.sun)) * 0.55 + 0.3;
+    const ballGlint = std.pow(
+      std.saturate(std.dot(std.reflect(incident, ballNormal), look.sun)),
+      80,
+    ) * 0.5;
+    const ball = d.vec3f(1, 0.72, 0.34) * lit + d.vec3f(ballGlint);
+    // Behind the scene, or under water: a ghost, not a bead.
+    let solid = d.f32(0.85) * look.spout.w;
+    if (sceneZ > front) {
+      solid = 0.14;
+    } else if (fluidZ > front && coverage > 0.4) {
+      solid *= 0.45;
+    }
+    // Soft edge, one texel wide.
+    const rim = 1 - std.smoothstep(0.86, 1, spoutRadial);
+    colour = std.mix(colour, ball, solid * rim);
+  }
 
   // Smoke sits between the scene and the eye and is already premultiplied, so
   // laying it over is one multiply-add. Its march stopped at the scene surface,
@@ -476,6 +777,13 @@ export interface LiquidLook {
   /** Brightness of the placed torch. Zero is off. */
   torch: number;
   torchAt: readonly [number, number, number];
+  glassesA: readonly [number, number, number, number];
+  glassesB: readonly [number, number, number, number];
+  /** Planted lamps: xyz position + power, then rgb tint + size. */
+  lightsA: readonly (readonly [number, number, number, number])[];
+  lightsB: readonly (readonly [number, number, number, number])[];
+  /** Spout marker: image xy, depth z, and ring emphasis in w. */
+  spout: readonly [number, number, number, number];
   lens: number;
   reflection: number;
   caustics: number;
@@ -493,17 +801,22 @@ export const defaultLook: LiquidLook = {
   tint: [0.74, 0.89, 0.96],
   surfaceLow: 0.1,
   surfaceHigh: 0.62,
-  relief: 0.4,
+  relief: 0.25,
   refraction: 0.09,
-  thickness: 0.22,
-  absorption: 2.2,
+  thickness: 0.5,
+  absorption: 1.1,
   scatter: 0.1,
   specular: 1.1,
   torch: 0,
   torchAt: [0.5, 0.4, Z_MAX * 0.8],
+  glassesA: [0.4, 0.4, 0.6, 0.4],
+  glassesB: [1, 1, 1, 0],
+  lightsA: Array.from({ length: 8 }, () => [0, 0, 0, 0] as const),
+  lightsB: Array.from({ length: 8 }, () => [0, 0, 0, 0.1] as const),
+  spout: [0.5, 0.1, Z_MAX * 0.92, 0.5],
   lens: 1.15,
   reflection: 0.12,
-  caustics: 0.8,
+  caustics: 0.5,
   foam: 6,
   flash: 0,
   sunBearing: -30,
@@ -514,7 +827,7 @@ export const defaultLook: LiquidLook = {
    * such a sheet renders as separate beads with gaps between them - which is
    * most of why thin water read as scattered glass rather than as water.
    */
-  splatRadius: REST_SPACING * 1.7,
+  splatRadius: REST_SPACING * 1.2,
   debug: DebugView.LIQUID,
 };
 
@@ -531,6 +844,7 @@ export interface LiquidInputs {
   readonly context: ReturnType<TgpuRoot['configureContext']>;
   readonly particles: ParticleBuffer;
   readonly scene: SingleChannelTexture;
+  readonly sceneBack: SingleChannelTexture;
   readonly smoke: SingleChannelTexture;
   readonly fieldParams: TgpuBuffer<typeof FieldParams> & UniformFlag;
   readonly linear: TgpuSampler;
@@ -564,7 +878,9 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
   const rawThickness = renderable();
   const scratch = createFieldTexture(root, SURFACE_RES);
   const fluid = createFieldTexture(root, SURFACE_RES);
+  const history = createFieldTexture(root, SURFACE_RES);
   const thickness = createFieldTexture(root, SURFACE_RES);
+  const thickHistory = createFieldTexture(root, SURFACE_RES);
 
   const depthBuffer = root
     .createTexture({ size: [SURFACE_RES, SURFACE_RES], format: 'depth24plus' })
@@ -581,6 +897,7 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
     look: lookParams,
     fluid: fluid.createView(),
     rawFluid: rawDepth.createView(),
+    sceneBack: inputs.sceneBack.createView(),
     thickness: thickness.createView(),
     scene: inputs.scene.createView(),
     smoke: inputs.smoke.createView(),
@@ -635,6 +952,36 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
     filterSampler: inputs.linear,
   });
 
+  const temporalBindGroup = root.createBindGroup(temporalLayout, {
+    current: fluid.createView(),
+    history: history.createView(),
+    target: scratch.createView(d.textureStorage2d('rgba16float', 'write-only')),
+  });
+  const temporal = root.createComputePipeline({ compute: temporalKernel });
+  const publishBindGroup = root.createBindGroup(publishLayout, {
+    source: scratch.createView(),
+    live: fluid.createView(d.textureStorage2d('rgba16float', 'write-only')),
+    keep: history.createView(d.textureStorage2d('rgba16float', 'write-only')),
+  });
+  const publish = root.createComputePipeline({ compute: publishKernel });
+  const surfaceGroups = Math.ceil(SURFACE_RES / 8);
+
+  // Thickness gets the same settling. It never elects a nearest particle, but
+  // it is the sum of every soft splat over the texel, and at the waterline
+  // that sum breathes with the jitter. Thickness drives opacity, absorption
+  // and the refraction shift, so its breathing was most of what survived the
+  // surface fix - frozen surface, still 0.6 grey levels of flicker.
+  const thickTemporalBindGroup = root.createBindGroup(temporalLayout, {
+    current: thickness.createView(),
+    history: thickHistory.createView(),
+    target: scratch.createView(d.textureStorage2d('rgba16float', 'write-only')),
+  });
+  const thickPublishBindGroup = root.createBindGroup(publishLayout, {
+    source: scratch.createView(),
+    live: thickness.createView(d.textureStorage2d('rgba16float', 'write-only')),
+    keep: thickHistory.createView(d.textureStorage2d('rgba16float', 'write-only')),
+  });
+
   const thicknessBlur = createSeparableBlur(root, {
     resolution: SURFACE_RES,
     radius: THICKNESS_BLUR_RADIUS,
@@ -644,6 +991,11 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
     target: thickness,
     blurSampler: inputs.linear,
   });
+
+  /** Copies a readonly 4-tuple into the mutable tuple the buffer write wants. */
+  function four(v: readonly [number, number, number, number]): [number, number, number, number] {
+    return [v[0], v[1], v[2], v[3]];
+  }
 
   function writeLook(): void {
     splatParams.write({ radius: look.splatRadius });
@@ -659,6 +1011,11 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
       specular: look.specular,
       torch: look.torch,
       torchAt: look.torchAt,
+      lightsA: look.lightsA.map(four),
+      lightsB: look.lightsB.map(four),
+      spout: four(look.spout),
+      glassesA: four(look.glassesA),
+      glassesB: four(look.glassesB),
       lens: look.lens,
       reflection: look.reflection,
       caustics: look.caustics,
@@ -679,6 +1036,8 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
         withCamera.initAsync(),
         withoutCamera.initAsync(),
         depthFilter.initAsync(),
+        temporal.initAsync(),
+        publish.initAsync(),
         thicknessBlur.initAsync(),
       ]);
     },
@@ -713,7 +1072,17 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
       // Sequential: both blurs share one scratch texture.
       const blurPass = encoder.beginComputePass();
       depthFilter.encode(blurPass);
+      // Settle the filtered surface against last frame's before anyone reads
+      // it. The scratch texture is free again once the filter has run.
+      temporal.with(blurPass).with(temporalBindGroup)
+        .dispatchWorkgroups(surfaceGroups, surfaceGroups);
+      publish.with(blurPass).with(publishBindGroup)
+        .dispatchWorkgroups(surfaceGroups, surfaceGroups);
       thicknessBlur.encode(blurPass);
+      temporal.with(blurPass).with(thickTemporalBindGroup)
+        .dispatchWorkgroups(surfaceGroups, surfaceGroups);
+      publish.with(blurPass).with(thickPublishBindGroup)
+        .dispatchWorkgroups(surfaceGroups, surfaceGroups);
       blurPass.end();
     },
 
@@ -758,6 +1127,8 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
       scratch.destroy();
       fluid.destroy();
       thickness.destroy();
+      history.destroy();
+      thickHistory.destroy();
       depthBuffer.destroy();
     },
   };

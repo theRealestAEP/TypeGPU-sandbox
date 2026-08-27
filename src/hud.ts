@@ -13,10 +13,16 @@ export interface TuneField {
   readonly step: number;
   readonly value: number;
   readonly format?: (value: number) => string;
+  /** Initial hex colour. Makes this a colour well; onTune receives 0xRRGGBB. */
+  readonly color?: string;
 }
 
 export interface TuneGroup {
   readonly title: string;
+  /** Which tool these settings belong to. Absent means always shown. */
+  readonly tool?: string;
+  /** Which scene these settings belong to; hidden everywhere else. */
+  readonly scene?: string;
   readonly fields: readonly TuneField[];
 }
 
@@ -56,7 +62,6 @@ export interface HudActions {
   readonly onRotation: (value: string) => void;
   readonly onMirror: (value: string) => void;
   readonly onDrain: () => void;
-  readonly onReset: () => void;
   readonly onTune: (key: string, value: number) => void;
 }
 
@@ -71,6 +76,10 @@ export interface Hud {
   setPouring(on: boolean): void;
   /** Move a slider to a value the app worked out for itself. */
   setTune(key: string, value: number): void;
+  /** Show only the active tool's settings groups. */
+  setToolFilter(tool: string): void;
+  /** Show scene-bound settings groups only on their scene. */
+  setSceneFilter(scene: string): void;
   setStorm(on: boolean): void;
   setMedium(id: string): void;
   dismissHint(): void;
@@ -107,6 +116,7 @@ function buildSegments(
   options.forEach((option, index) => {
     const button = element('button');
     button.type = 'button';
+    button.dataset.id = option.id;
     button.setAttribute('aria-pressed', String(index === 0));
     button.append(option.label);
     const hint = element('kbd');
@@ -178,6 +188,7 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
   function setPouring(on: boolean): void {
     pouring = on;
     document.body.dataset.pouring = String(on);
+    document.body.dataset.pouring = String(on);
     pourButton.setAttribute('aria-pressed', String(on));
     pourButton.firstChild?.replaceWith(on ? 'Pouring' : 'Hold');
   }
@@ -202,7 +213,6 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
   );
   requireElement('open').addEventListener('click', actions.onOpen);
   requireElement('drain').addEventListener('click', actions.onDrain);
-  requireElement('reset').addEventListener('click', actions.onReset);
 
   function toggleDrawer(open?: boolean): void {
     const next = open ?? drawer.dataset.open !== 'true';
@@ -231,13 +241,21 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
     host.append(field);
   }
 
+  // Source plumbing - camera orientation, model size - is not a tool setting
+  // anyone reaches for while playing, so it folds away instead of padding
+  // every tool's drawer out to "all the settings".
+  const plumbing = element('details', 'plumbing');
+  const plumbingLabel = element('summary');
+  plumbingLabel.textContent = 'source & model';
+  plumbing.append(plumbingLabel);
+
   const cameraGroup = element('div', 'group');
   const cameraHeading = element('h3');
   cameraHeading.textContent = 'camera';
   cameraGroup.append(cameraHeading);
   addChoice(cameraGroup, config.rotation, actions.onRotation);
   addChoice(cameraGroup, config.mirror, actions.onMirror);
-  body.append(cameraGroup);
+  plumbing.append(cameraGroup);
 
   const modelGroup = element('div', 'group');
   const modelHeading = element('h3');
@@ -256,13 +274,22 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
   modelSelect.addEventListener('change', () => actions.onModel(modelSelect.value));
   modelField.append(modelLabel, modelSelect);
   modelGroup.append(modelHeading, modelField);
-  body.append(modelGroup);
+  plumbing.append(modelGroup);
 
   /** Sliders by key, so measured values can be shown back on the control. */
   const tuneFields = new Map<string, (value: number) => void>();
 
+  const toolSections: { tool: string; section: HTMLElement }[] = [];
+  const sceneSections: { scene: string; section: HTMLElement }[] = [];
+
   for (const group of config.groups) {
     const section = element('div', 'group');
+    if (group.tool) {
+      toolSections.push({ tool: group.tool, section });
+    }
+    if (group.scene) {
+      sceneSections.push({ scene: group.scene, section });
+    }
     const heading = element('h3');
     heading.textContent = group.title;
     section.append(heading);
@@ -274,6 +301,21 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
       const show = (value: number) => {
         readout.textContent = field.format ? field.format(value) : value.toFixed(3);
       };
+
+      if (field.color) {
+        const well = element('input');
+        well.type = 'color';
+        well.value = field.color;
+        well.addEventListener('input', () => {
+          readout.textContent = well.value;
+          actions.onTune(field.key, Number.parseInt(well.value.slice(1), 16));
+        });
+        readout.textContent = field.color;
+        label.append(field.label, readout);
+        wrapper.append(label, well);
+        section.append(wrapper);
+        continue;
+      }
 
       const input = element('input');
       input.type = 'range';
@@ -298,6 +340,7 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
     }
     body.append(section);
   }
+  body.append(plumbing);
 
   // --- keyboard ---
   addEventListener('keydown', (event) => {
@@ -333,8 +376,6 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
       actions.onStorm(storming);
     } else if (pressed === 'd') {
       actions.onDrain();
-    } else if (pressed === 'r') {
-      actions.onReset();
     } else if (pressed === 't') {
       toggleDrawer();
     } else {
@@ -370,6 +411,20 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
 
     setTune(key, value) {
       tuneFields.get(key)?.(value);
+    },
+
+    setToolFilter(tool) {
+      // The drawer shows the active tool's settings and the shared ones;
+      // thirty-eight sliders at once is how the drawer earned its reputation.
+      for (const { tool: owner, section } of toolSections) {
+        section.hidden = owner !== tool;
+      }
+    },
+
+    setSceneFilter(scene) {
+      for (const { scene: owner, section } of sceneSections) {
+        section.hidden = owner !== scene;
+      }
     },
     setStorm,
     setMedium: selectMedium,

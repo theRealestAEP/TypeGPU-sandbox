@@ -3,6 +3,8 @@ import { ROTATIONS, createCameraSession, detectRotation, rotationGeometry } from
 import type { Rotation } from './camera.ts';
 import type { CameraFrame, DepthSource } from './depth/depth-field.ts';
 import { createSceneLight } from './depth/lighting.ts';
+import type { Gestures, Tracked } from './track/gestures.ts';
+import { type Vessel, createVesselProbe, findVessels } from './depth/vessels.ts';
 import { createModelDepth } from './depth/model-depth.ts';
 import { MODEL_SIZES, RECOMMENDED_MODEL, type ModelSize } from './depth/model-store.ts';
 import { createSyntheticDepth } from './depth/synthetic-depth.ts';
@@ -10,7 +12,7 @@ import { createFieldTexture } from './gpu/blur.ts';
 import { createHud } from './hud.ts';
 import type { TuneGroup } from './hud.ts';
 import { createLiquidRenderer, defaultLook } from './render/liquid.ts';
-import { START_FRACTION, createFluid, defaultTuning } from './sim/fluid.ts';
+import { createFluid, defaultTuning } from './sim/fluid.ts';
 import {
   FIELD_RES,
   MAX_DEPTH_SCALE,
@@ -56,6 +58,34 @@ type SceneId = (typeof SCENES)[number]['id'];
 const MEDIA = [
   { id: 'water', label: 'Water', key: 'M' },
   { id: 'smoke', label: 'Smoke', key: 'N' },
+  { id: 'light', label: 'Light', key: 'L' },
+  { id: 'props', label: 'Objects', key: 'B' },
+] as const;
+
+/**
+ * Things that can be planted in the scene and keep going on their own. Each is
+ * a standing smoke source plus, where it burns, a lamp - a cigarette is a wisp
+ * and a dim ember, a torch is a plume and a flame.
+ */
+const PROP_KINDS = [
+  {
+    id: 'cigarette',
+    label: 'Cigarette',
+    smoke: { rate: 0.5, radius: 0.035, heat: 2.5 },
+    lamp: { power: 0.35, size: 0.05, tint: [1, 0.45, 0.18] as const, flicker: 0.25 },
+  },
+  {
+    id: 'torch',
+    label: 'Torch',
+    smoke: { rate: 1.4, radius: 0.075, heat: 6 },
+    lamp: { power: 2.4, size: 0.16, tint: [1, 0.58, 0.2] as const, flicker: 1 },
+  },
+  {
+    id: 'campfire',
+    label: 'Fire',
+    smoke: { rate: 2.2, radius: 0.12, heat: 7.5 },
+    lamp: { power: 3.4, size: 0.24, tint: [1, 0.5, 0.16] as const, flicker: 1 },
+  },
 ] as const;
 type MediumId = (typeof MEDIA)[number]['id'];
 
@@ -68,7 +98,7 @@ const VIEWS = [
 ] as const;
 
 const PHOTO_URL = '/bathroom.jpg';
-const CLIP_URL = '/sink.webm';
+const CLIP_URL = '/dishes.webm';
 
 /**
  * Named setups. Each one is a scene plus the handful of settings that make it
@@ -89,6 +119,10 @@ interface Scenario {
   readonly spout: readonly [number, number];
   /** Spout depth. Near the camera keeps water in front of foreground subjects. */
   readonly spoutZ?: number;
+  /** A still of its own; scenarios without one share the default photo. */
+  readonly photo?: string;
+  /** A clip of its own; scenarios without one share the default clip. */
+  readonly clip?: string;
   readonly look: Partial<typeof defaultLook>;
 }
 
@@ -102,14 +136,20 @@ const SCENARIOS: readonly Scenario[] = [
     medium: 'water',
     flow: 55,
     smoke: 0,
-    // Under the tap, so the pour comes out of the spout in the picture.
+    // Under the tap, so the pour comes out of the spout in the picture. The
+    // depth matters as much as the aim: at the tub's true, nearly level pitch,
+    // gravity barely carries a drop backward, so a spout left at the default
+    // near-camera depth rains in front of the tub and everything lands on the
+    // bathroom floor. What looked like the tub leaking was the tub never being
+    // hit. Spawning just above the basin mouth fills it 8.5x better.
     spout: [0.5, 0.36],
-    look: { caustics: 0.8, foam: 6, scatter: 0.1 },
+    spoutZ: 0.45,
+    look: { caustics: 0.4, foam: 6, scatter: 0.1 },
   },
   {
     id: 'kittens',
-    label: 'Sink',
-    note: 'clip - a hand moves through it',
+    label: 'Washing up',
+    note: 'clip - hands in the stream',
     scene: 'clip',
     storm: false,
     medium: 'water',
@@ -118,6 +158,19 @@ const SCENARIOS: readonly Scenario[] = [
     spout: [0.55, 0.12],
     spoutZ: Z_MAX * 0.88,
     look: { caustics: 0.7, foam: 6, scatter: 0.14 },
+  },
+  {
+    id: 'flood',
+    label: 'Flood the city',
+    note: 'clip - rain on a junction',
+    scene: 'clip',
+    clip: '/city.webm',
+    storm: true,
+    medium: 'water',
+    flow: 80,
+    smoke: 0,
+    spout: [0.5, 0.06],
+    look: { caustics: 1.0, foam: 10, scatter: 0.14 },
   },
   {
     id: 'downpour',
@@ -133,27 +186,17 @@ const SCENARIOS: readonly Scenario[] = [
   },
   {
     id: 'steam',
-    label: 'Steam room',
-    note: 'photo - steam, not water',
+    label: 'Stove and hood',
+    note: 'photo - steam pools under the hood',
     scene: 'photo',
+    photo: '/kitchen.jpg',
     storm: false,
     medium: 'smoke',
     flow: 45,
     smoke: 4,
-    spout: [0.45, 0.55],
+    // On the hob, so the plume climbs into the extractor's underside.
+    spout: [0.55, 0.87],
     look: { caustics: 0.6, foam: 8, scatter: 0.18 },
-  },
-  {
-    id: 'vessels',
-    label: 'Three vessels',
-    note: 'built scene - aim it',
-    scene: 'vessels',
-    storm: false,
-    medium: 'water',
-    flow: 24,
-    smoke: 0,
-    spout: [0.52, 0.1],
-    look: { caustics: 0.5, foam: 6, scatter: 0.16 },
   },
   {
     id: 'live',
@@ -185,6 +228,17 @@ function requireElements() {
 
 const TUNE_GROUPS: readonly TuneGroup[] = [
   {
+    // Filters, not a tool: nothing pours or places, so this rides on the scene
+    // instead of the tool row, appearing for every tool while the camera runs.
+    title: 'face filters',
+    scene: 'camera',
+    fields: [
+      { key: 'faceSweat', label: 'sweat', min: 0, max: 12, step: 1, value: 0, format: (v) => v.toFixed(0) },
+      { key: 'faceTears', label: 'tears', min: 0, max: 12, step: 1, value: 0, format: (v) => v.toFixed(0) },
+      { key: 'faceGlasses', label: 'party glasses', min: 0, max: 2, step: 0.05, value: 0 },
+    ],
+  },
+  {
     title: 'world',
     fields: [
       { key: 'depthScale', label: 'scene depth', min: 0.1, max: MAX_DEPTH_SCALE, step: 0.01, value: defaultTuning.depthScale },
@@ -197,6 +251,7 @@ const TUNE_GROUPS: readonly TuneGroup[] = [
   },
   {
     title: 'pour',
+    tool: 'water',
     fields: [
       { key: 'emitRate', label: 'flow', min: 1, max: 300, step: 1, value: defaultTuning.emitRate, format: (v) => v.toFixed(0) },
 
@@ -207,6 +262,7 @@ const TUNE_GROUPS: readonly TuneGroup[] = [
   },
   {
     title: 'physics',
+    tool: 'water',
     fields: [
       { key: 'viscosity', label: 'viscosity', min: 0, max: 0.4, step: 0.005, value: defaultTuning.viscosity },
       { key: 'cohesion', label: 'cohesion', min: 0, max: 8e-5, step: 1e-6, value: defaultTuning.cohesion, format: (v) => v.toExponential(1) },
@@ -216,8 +272,9 @@ const TUNE_GROUPS: readonly TuneGroup[] = [
   },
   {
     title: 'smoke',
+    tool: 'smoke',
     fields: [
-      { key: 'smokeRate', label: 'smoke', min: 0, max: 8, step: 0.1, value: defaultSmokeTuning.emitRate },
+      { key: 'smokeRate', label: 'smoke', min: 0, max: 8, step: 0.1, value: 3 },
       { key: 'emitHeat', label: 'heat', min: 0, max: 8, step: 0.1, value: defaultSmokeTuning.emitHeat },
       { key: 'buoyancy', label: 'lift', min: 0, max: 3, step: 0.02, value: defaultSmokeTuning.buoyancy },
       { key: 'cooling', label: 'cooling', min: 0, max: 2, step: 0.02, value: defaultSmokeTuning.cooling },
@@ -229,7 +286,18 @@ const TUNE_GROUPS: readonly TuneGroup[] = [
     ],
   },
   {
+    title: 'lamp',
+    tool: 'light',
+    fields: [
+      { key: 'lightPower', label: 'brightness', min: 0.2, max: 6, step: 0.05, value: 1.4 },
+      { key: 'lightColor', label: 'colour', min: 0, max: 1, step: 1, value: 0, color: '#ffa847' },
+      { key: 'lightSize', label: 'size', min: 0.04, max: 0.5, step: 0.01, value: 0.16 },
+      { key: 'torch', label: 'held light (follows spout)', min: 0, max: 4, step: 0.05, value: defaultLook.torch },
+    ],
+  },
+  {
     title: 'look',
+    tool: 'water',
     fields: [
       { key: 'splatRadius', label: 'bead size', min: REST_SPACING * 0.6, max: REST_SPACING * 3, step: REST_SPACING / 40, value: defaultLook.splatRadius, format: (v) => (v / REST_SPACING).toFixed(2) + '\u00d7' },
       { key: 'surfaceLow', label: 'surface', min: 0.02, max: 1, step: 0.01, value: defaultLook.surfaceLow },
@@ -238,7 +306,6 @@ const TUNE_GROUPS: readonly TuneGroup[] = [
       { key: 'lens', label: 'lens (wide - long)', min: 0.5, max: 3, step: 0.05, value: defaultLook.lens },
       { key: 'reflection', label: 'reflection', min: 0, max: 0.5, step: 0.005, value: defaultLook.reflection },
       { key: 'refraction', label: 'refraction', min: 0, max: 0.3, step: 0.002, value: defaultLook.refraction },
-      { key: 'torch', label: 'torch (follows spout)', min: 0, max: 4, step: 0.05, value: defaultLook.torch },
       { key: 'caustics', label: 'caustics', min: 0, max: 4, step: 0.05, value: defaultLook.caustics },
       { key: 'foam', label: 'foam', min: 0, max: 90, step: 1, value: defaultLook.foam, format: (v) => v.toFixed(0) },
       { key: 'relief', label: 'relief', min: 0, max: 2, step: 0.02, value: defaultLook.relief },
@@ -279,10 +346,12 @@ async function main(): Promise<void> {
   const model = createModelDepth(root, depth);
   const field = createSurfaceField(root, depth, linear);
   const sceneLight = createSceneLight(root, field.surface, linear);
+  const vesselProbe = createVesselProbe(root, field.surface, linear);
   const fluid = createFluid(root, {
     surface: field.surface,
     surfacePrev: field.surfacePrev,
     surfaceLive: field.live,
+    surfaceBack: field.background,
     scene: field.scene,
     fieldSampler: linear,
     obstacleDt: () => obstacleDt,
@@ -290,12 +359,16 @@ async function main(): Promise<void> {
   const smoke = createSmoke(root, {
     surface: field.surface,
     scene: field.scene,
+    // The smoke shades with the light measured from the picture, so a plume in
+    // a warm room is a warm plume.
+    light: sceneLight.state,
     fieldSampler: linear,
   });
   const renderer = createLiquidRenderer(root, {
     context,
     particles: fluid.particles,
     scene: field.surface,
+    sceneBack: field.background,
     smoke: smoke.image,
     fieldParams: field.params,
     linear,
@@ -312,6 +385,10 @@ async function main(): Promise<void> {
   let loadedSize: ModelSize | undefined;
   /** The still currently in use: the bundled one until a file replaces it. */
   let photo: ImageBitmap | undefined;
+  /** Which bundled still the photo scene shows; scenarios can swap it. */
+  let photoUrl = PHOTO_URL;
+  const photoCache = new Map<string, ImageBitmap>();
+  let dropSerial = 0;
   /** A dropped video clip, which drives depth per frame like the camera does. */
   let clipUrl: string | undefined;
   /** The clip currently in use, bundled or dropped. */
@@ -325,10 +402,32 @@ async function main(): Promise<void> {
   let storming = false;
   /** What the spout is carrying. One at a time. */
   let medium: MediumId = 'water';
-  /** One blanking pass owed to the compositor after smoke stops. */
+  /** One blanking pass owed to the compositor after a scene reset. */
   let smokeStale = false;
-  let smokeRate = defaultSmokeTuning.emitRate;
+  /** Smoke keeps simulating once any has been emitted, until the reset. */
+  let smokeAlive = false;
+  // NOT seeded from defaultSmokeTuning.emitRate: that is the emitter's at-rest
+  // state (zero, correctly), while this is how hard the smoke TOOL pours when
+  // held. Seeding from the struct made the smoke tool silently emit nothing
+  // until some scenario happened to overwrite the rate.
+  let smokeRate = 3;
   let gust = 0;
+  /** Face and hand tracking, loaded the first time a video scene opens. */
+  let gestures: Gestures | undefined;
+  let gesturesLoading = false;
+  let tracked: Tracked = { brow: [], eyes: [], lenses: [], effort: 0 };
+  /** Fingertip control of the active tool; the toggle beside the readouts. */
+  let handControl = true;
+  /** Light-up glasses: brightness slider; the colour cycles on its own. */
+  let glassesGlow = 0;
+  let glassesOn = false;
+  /** Pinching index and thumb pours, hands-free. */
+  let fingerPour = false;
+  /** Water from the face itself: sliders in the face group. */
+  let sweatRate = 0;
+  let tearRate = 0;
+  let faceOwned = false;
+  let springStep = 0;
   let recycling = false;
   let solverSteps = 0;
   let encodes = 0;
@@ -346,13 +445,127 @@ async function main(): Promise<void> {
   let emitRate = defaultTuning.emitRate;
   /** Torch brightness before the flicker is applied. */
   let torchStrength = defaultLook.torch;
+  /** Lights the user has planted in the scene. Position, then colour+size. */
+  const placedLights: { at: [number, number, number]; tint: [number, number, number]; size: number; power: number }[] = [];
+  let lightPower = 1.4;
+  let lightRgb: [number, number, number] = [1, 0.66, 0.28];
+  let lightSize = 0.16;
+  /** Where the pointer last was over the plate, for the lamp that follows it. */
+  let hoverX = 0.5;
+  let hoverY = 0.5;
+  /** Planted objects: standing smoke sources with their own light. */
+  const placedProps: {
+    kind: (typeof PROP_KINDS)[number];
+    at: [number, number, number];
+  }[] = [];
+  let propKind: (typeof PROP_KINDS)[number] = PROP_KINDS[1];
+
+  function pushProps(): void {
+    smoke.tune({
+      props: placedProps.map((prop) => ({
+        at: prop.at,
+        rate: prop.kind.smoke.rate,
+        radius: prop.kind.smoke.radius,
+        heat: prop.kind.smoke.heat,
+      })),
+    });
+    if (placedProps.length > 0) {
+      smokeAlive = true;
+    }
+    pushLights();
+  }
+
+  function placeProp(): void {
+    if (placedProps.length >= 4) {
+      placedProps.shift();
+    }
+    placedProps.push({ kind: propKind, at: [hoverX, hoverY, spoutZ] });
+    pushProps();
+  }
+
+  function lightTint(): [number, number, number] {
+    return lightRgb;
+  }
+
+  /**
+   * Empties everything the user has added: water, smoke, planted lamps. Reset
+   * does it on demand, and a change of picture does it automatically - liquid
+   * that settled into the old scene's basins is standing in mid-air in the new
+   * one, and a lamp hung on a wall that no longer exists is worse.
+   */
+  function resetScene(): void {
+    fluid.drain();
+    inScene = 0;
+    recycling = false;
+    fluid.tune({ recycle: false });
+    smokeAlive = false;
+    smokeStale = true;
+    placedLights.length = 0;
+    placedProps.length = 0;
+    pushProps();
+    // Gravity starts over too: unpinned, and the estimate's memory snapped to
+    // level so the new scene measures fresh instead of inheriting the last
+    // scene's tilt - the webcam was opening with the city's steep pitch.
+    gravityManual = false;
+    field.tune({ manual: false });
+    field.scene.write({ down: [0, 1, 0], drift: 0 });
+    // An active pour re-arms its medium; without this a scenario that resets
+    // and then pours smoke had its smoke switched off by its own reset.
+    applyFlow();
+  }
+
+  /**
+   * Seven placed lamps plus one live slot: while the light tool is in hand, the
+   * last slot is a full lamp that rides the cursor, so what you see hovering is
+   * exactly what a click will leave behind - same shading path, no preview
+   * approximation.
+   */
+  function pushLights(): void {
+    const a: [number, number, number, number][] = [];
+    const b: [number, number, number, number][] = [];
+    const now = performance.now();
+    for (const prop of placedProps) {
+      const f = prop.kind.lamp.flicker;
+      const wave = 1 - f * 0.22 + f * (0.13 * Math.sin(now / 67) + 0.09 * Math.sin(now / 29 + 2.1));
+      a.push([prop.at[0], prop.at[1], prop.at[2], prop.kind.lamp.power * wave]);
+      b.push([prop.kind.lamp.tint[0], prop.kind.lamp.tint[1], prop.kind.lamp.tint[2], prop.kind.lamp.size]);
+    }
+    for (let i = 0; i < 7 - placedProps.length; i++) {
+      const l = placedLights[i];
+      a.push(l ? [l.at[0], l.at[1], l.at[2], l.power] : [0, 0, 0, 0]);
+      b.push(l ? [l.tint[0], l.tint[1], l.tint[2], l.size] : [0, 0, 0, 0.1]);
+    }
+    if (medium === 'light') {
+      const tint = lightTint();
+      a.push([hoverX, hoverY, spoutZ, lightPower]);
+      b.push([tint[0], tint[1], tint[2], lightSize]);
+    } else {
+      a.push([0, 0, 0, 0]);
+      b.push([0, 0, 0, 0.1]);
+    }
+    renderer.look({ lightsA: a, lightsB: b });
+  }
+
+  function placeLight(): void {
+    // Seven is plenty; past that, the oldest one moves.
+    if (placedLights.length >= 7) {
+      placedLights.shift();
+    }
+    placedLights.push({
+      at: [hoverX, hoverY, spoutZ],
+      tint: lightTint(),
+      size: lightSize,
+      power: lightPower,
+    });
+    pushLights();
+  }
   /**
    * Water in the scene, counted by the solver and read back a few times a
    * second. Adding up what the spout released instead was open-loop: nothing
    * ever told it about water that drained off the frame, so the meter sat at
    * two thirds full over a pool with nothing in it.
    */
-  let inScene = Math.round(PARTICLE_COUNT * START_FRACTION);
+  let inScene = 0;
   /** One census readback in flight at a time. */
   let censusPending = false;
   let lastCensusAt = 0;
@@ -365,6 +578,10 @@ async function main(): Promise<void> {
   let gravityRoll = 0;
   let gravityPending = false;
   let lastGravityAt = 0;
+  /** The vessel probe re-floods a downsample of the scene while tuning. */
+  let vesselPending = false;
+  let lastVesselAt = 0;
+  let depthScaleNow = defaultTuning.depthScale;
 
   const hud = createHud(
     {
@@ -385,6 +602,9 @@ async function main(): Promise<void> {
       onScene: (id) => {
         const match = SCENES.find((candidate) => candidate.id === id);
         if (match) {
+          if (match.id !== sceneId) {
+            resetScene();
+          }
           void selectScene(match.id);
         }
       },
@@ -458,23 +678,19 @@ async function main(): Promise<void> {
         hud.dismissHint();
         gravityManual = false;
         field.tune({ manual: false });
-        if (sceneId !== scenario.scene) {
+        const nextPhoto = scenario.photo ?? PHOTO_URL;
+        const photoChanged = scenario.scene === 'photo' && nextPhoto !== photoUrl;
+        photoUrl = nextPhoto;
+        const nextClip = scenario.clip ?? CLIP_URL;
+        const clipChanged = scenario.scene === 'clip' && nextClip !== clipSource;
+        clipSource = nextClip;
+        if (sceneId !== scenario.scene || photoChanged || clipChanged) {
+          resetScene();
           hud.setScene(scenario.scene);
           void selectScene(scenario.scene);
         }
       },
-      onDrain: () => {
-        fluid.drain();
-        inScene = 0;
-        recycling = false;
-        fluid.tune({ recycle: false });
-      },
-      onReset: () => {
-        fluid.reset();
-        inScene = Math.round(PARTICLE_COUNT * START_FRACTION);
-        recycling = false;
-        fluid.tune({ recycle: false });
-      },
+      onDrain: () => resetScene(),
       onTune: (key, value) => {
         if (key === 'sunBearing' || key === 'sunHeight') {
           // One key light. Smoke lit from somewhere else reads as a sticker.
@@ -496,10 +712,12 @@ async function main(): Promise<void> {
             gravityRoll = value;
           }
           field.tune({ manual: true, pitch: gravityPitch, roll: gravityRoll });
+          showGravity();
           hud.setStatus('info', `Down is pinned at ${gravityPitch.toFixed(0)}\u00b0 pitch. Pick a scene to measure it again.`);
           return;
         }
         if (key === 'depthScale') {
+          depthScaleNow = value;
           // The solver, the smoke and the compositor must agree on how deep the
           // scene is.
           fluid.tune({ depthScale: value });
@@ -507,9 +725,35 @@ async function main(): Promise<void> {
           smoke.tune({ depthScale: value });
           return;
         }
+        if (key === 'lightPower' || key === 'lightColor' || key === 'lightSize') {
+          if (key === 'lightPower') {
+            lightPower = value;
+          } else if (key === 'lightColor') {
+            // The colour well delivers packed 0xRRGGBB.
+            lightRgb = [
+              ((value >> 16) & 255) / 255,
+              ((value >> 8) & 255) / 255,
+              (value & 255) / 255,
+            ];
+          } else {
+            lightSize = value;
+          }
+          pushLights();
+          return;
+        }
         if (key === 'torch') {
           torchStrength = value;
           renderer.look({ torch: value, torchAt: [spoutX, spoutY, spoutZ] });
+          return;
+        }
+        if (key === 'faceSweat' || key === 'faceTears' || key === 'faceGlasses') {
+          if (key === 'faceSweat') {
+            sweatRate = value;
+          } else if (key === 'faceTears') {
+            tearRate = value;
+          } else {
+            glassesGlow = value;
+          }
           return;
         }
         if (key === 'emitRate') {
@@ -543,12 +787,13 @@ async function main(): Promise<void> {
     fluid.initAsync(),
     smoke.initAsync(),
     sceneLight.initAsync(),
+    vesselProbe.initAsync(),
     renderer.initAsync(),
   ]);
 
   // --- aiming ---
   function pouringNow(): boolean {
-    return storming || latched || holding;
+    return storming || latched || holding || fingerPour;
   }
 
   /** One source, one medium. The other one is off, whatever the button says. */
@@ -562,26 +807,25 @@ async function main(): Promise<void> {
       spoutShare: storming ? (aiming ? 0.5 : 0) : 1,
     });
     smoke.tune({ emitRate: live && medium === 'smoke' ? smokeRate : 0 });
+    if (live && medium === 'smoke') {
+      smokeAlive = true;
+    }
   }
 
   /**
-   * Switching medium clears what the other one left behind, so the scene holds
-   * one thing at a time rather than a pool with a plume hanging over it.
+   * A tool, not a mode. Switching tools changes what the spout emits and which
+   * settings the drawer shows; whatever is already in the scene stays and keeps
+   * simulating. Water under a plume of steam is the whole point.
    */
   function setMedium(next: MediumId): void {
     if (next === medium) {
       return;
     }
     medium = next;
-    if (medium === 'water') {
-      smokeStale = true;
-    } else {
-      fluid.drain();
-      inScene = 0;
-      recycling = false;
-      fluid.tune({ recycle: false });
-      hud.setFill(0);
-    }
+    document.body.dataset.tool = medium;
+    hud.setToolFilter(medium);
+    // Adds or removes the cursor lamp as the light tool comes and goes.
+    pushLights();
     applyFlow();
   }
 
@@ -590,6 +834,11 @@ async function main(): Promise<void> {
    * unsteadiness is most of what says fire.
    */
   function driveTorch(now: number): void {
+    // Burning props flicker; refreshing the light array each frame is what
+    // makes an ember breathe instead of glowing like an LED.
+    if (placedProps.some((prop) => prop.kind.lamp.flicker > 0)) {
+      pushLights();
+    }
     if (torchStrength <= 0) {
       return;
     }
@@ -601,14 +850,101 @@ async function main(): Promise<void> {
     renderer.look({ torch: torchStrength * flicker, torchAt: [spoutX, spoutY, spoutZ] });
   }
 
+  /**
+   * Draws the measured down on the picture: the arrow is the part of it that
+   * lies in the image, and the part running into the scene is written out,
+   * since it has no length on screen to show.
+   */
+  const gravityArrow = document.getElementById('gravityArrow');
+  const gravityNote = document.getElementById('gravityNote');
+  function showGravity(): void {
+    if (!gravityArrow || !gravityNote) {
+      return;
+    }
+    const flat = Math.cos((gravityPitch * Math.PI) / 180);
+    gravityArrow.style.setProperty('--roll', `${gravityRoll.toFixed(1)}deg`);
+    gravityArrow.style.setProperty('--len', `${(flat * 6).toFixed(2)}rem`);
+    const lean = gravityManual ? 'pinned' : 'measured';
+    gravityNote.textContent =
+      `down · ${gravityPitch.toFixed(0)}\u00b0 into scene · ${gravityRoll.toFixed(0)}\u00b0 roll · ${lean}`;
+  }
+
+  // Hand control: shown only where there is a hand to track, toggled by
+  // button or the H key.
+  const handToggle = document.getElementById('handToggle');
+  // "Face filters" is a doorway, not a tool: it opens the drawer where the
+  // camera-scene filters live.
+  const faceFilters = document.getElementById('faceFilters');
+  faceFilters?.addEventListener('click', () => {
+    const drawer = document.getElementById('tune');
+    if (drawer?.dataset.open !== 'true') {
+      document.getElementById('tuneToggle')?.click();
+    }
+  });
+  function setHandControl(on: boolean): void {
+    handControl = on;
+    handToggle?.setAttribute('aria-pressed', String(on));
+  }
+  handToggle?.addEventListener('click', () => setHandControl(!handControl));
+  addEventListener('keydown', (event) => {
+    if (event.metaKey || event.ctrlKey || event.altKey) {
+      return;
+    }
+    if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) {
+      return;
+    }
+    if (event.key.toLowerCase() === 'h') {
+      setHandControl(!handControl);
+    }
+  });
+
+  // The Objects dropdown: which prop a click plants.
+  const propPick = document.getElementById('propKind');
+  if (propPick instanceof HTMLSelectElement) {
+    for (const kind of PROP_KINDS) {
+      const option = document.createElement('option');
+      option.value = kind.id;
+      option.textContent = kind.label;
+      propPick.append(option);
+    }
+    propPick.value = propKind.id;
+    propPick.addEventListener('change', () => {
+      propKind = PROP_KINDS.find((kind) => kind.id === propPick.value) ?? PROP_KINDS[1];
+    });
+  }
+
+  const vesselHost = document.getElementById('vessels');
+  function drawVessels(list: Vessel[]): void {
+    if (!vesselHost) {
+      return;
+    }
+    while (vesselHost.children.length > list.length) {
+      vesselHost.lastChild?.remove();
+    }
+    while (vesselHost.children.length < list.length) {
+      const el = document.createElement('div');
+      el.className = 'vessel';
+      el.append(document.createElement('span'));
+      vesselHost.append(el);
+    }
+    list.forEach((vessel, index) => {
+      const el = vesselHost.children[index];
+      if (!(el instanceof HTMLElement)) {
+        return;
+      }
+      el.style.left = `${vessel.box.x0 * 100}%`;
+      el.style.top = `${vessel.box.y0 * 100}%`;
+      el.style.width = `${(vessel.box.x1 - vessel.box.x0) * 100}%`;
+      el.style.height = `${(vessel.box.y1 - vessel.box.y0) * 100}%`;
+      const label = el.firstChild;
+      if (label instanceof HTMLElement) {
+        label.textContent = `holds ${vessel.depth.toFixed(2)}`;
+      }
+    });
+  }
+
   function syncSpout(): void {
-    const bounds = canvas.getBoundingClientRect();
-    hud.setSpout(
-      bounds.left + spoutX * bounds.width,
-      bounds.top + spoutY * bounds.height,
-      spoutZ / Z_MAX,
-      pouringNow(),
-    );
+    renderer.look({ spout: [spoutX, spoutY, spoutZ, pouringNow() ? 1 : 0.55] });
   }
 
   function moveSpout(clientX: number, clientY: number): void {
@@ -624,6 +960,13 @@ async function main(): Promise<void> {
     spoutZ = Math.min(Math.max(next, 0.05), Z_MAX - 0.05);
     fluid.tune({ emitterZ: spoutZ });
     smoke.tune({ emitterZ: spoutZ });
+    if (medium === 'light') {
+      // The scroll wheel is the lamp's depth control; the glow and the marker
+      // both follow it immediately.
+      pushLights();
+      renderer.look({ spout: [hoverX, hoverY, spoutZ, 0.8] });
+      return;
+    }
     syncSpout();
   }
 
@@ -632,9 +975,26 @@ async function main(): Promise<void> {
     canvas.setPointerCapture(event.pointerId);
     hud.dismissHint();
     moveSpout(event.clientX, event.clientY);
+    // The light tool plants a lamp where you touch; the spout follows so the
+    // preview and the scroll-for-depth control still make sense.
+    if (medium === 'light') {
+      placeLight();
+    }
+    if (medium === 'props') {
+      placeProp();
+    }
     applyFlow();
   });
   canvas.addEventListener('pointermove', (event) => {
+    const bounds = canvas.getBoundingClientRect();
+    hoverX = Math.min(Math.max((event.clientX - bounds.left) / bounds.width, 0.02), 0.98);
+    hoverY = Math.min(Math.max((event.clientY - bounds.top) / bounds.height, 0.02), 0.98);
+    if (medium === 'light') {
+      // The lamp in hand follows the cursor without any button held, and the
+      // marker ball rides along so the glow has a visible source.
+      pushLights();
+      renderer.look({ spout: [hoverX, hoverY, spoutZ, 0.8] });
+    }
     if (holding) {
       moveSpout(event.clientX, event.clientY);
     }
@@ -705,8 +1065,22 @@ async function main(): Promise<void> {
         hud.setScene('clip');
         await selectScene('clip');
       } else {
-        photo?.close();
-        photo = await createImageBitmap(file);
+        // The dropped still joins the cache like any other, under its own key.
+        // Closing the old bitmap here was the bug the media agent caught: the
+        // "old" bitmap was also a cache entry, and the next scenario handed the
+        // detached corpse to VideoFrame on every frame from then on.
+        const bitmap = await createImageBitmap(file);
+        photoUrl = `drop:${file.name}:${dropSerial++}`;
+        photoCache.set(photoUrl, bitmap);
+        if (photoCache.size > 6) {
+          for (const [key, cached] of photoCache) {
+            if (key !== photoUrl) {
+              photoCache.delete(key);
+              cached.close();
+              break;
+            }
+          }
+        }
         hud.setScene('photo');
         await selectScene('photo');
       }
@@ -828,6 +1202,14 @@ async function main(): Promise<void> {
   async function selectScene(next: SceneId): Promise<void> {
     const previous = sceneId;
     sceneId = next;
+    document.body.dataset.scene = next;
+    hud.setSceneFilter(next);
+    if (handToggle) {
+      handToggle.hidden = next !== 'camera' && next !== 'clip';
+    }
+    if (faceFilters) {
+      faceFilters.hidden = next !== 'camera';
+    }
     try {
       if (next === 'vessels') {
         camera.stop();
@@ -839,7 +1221,11 @@ async function main(): Promise<void> {
         camera.stop();
         stopClip();
         hud.setStatus('info', 'Loading the photo…');
-        photo ??= await createImageBitmap(await (await fetch(PHOTO_URL)).blob());
+        photo = photoCache.get(photoUrl);
+        if (!photo) {
+          photo = await createImageBitmap(await (await fetch(photoUrl)).blob());
+          photoCache.set(photoUrl, photo);
+        }
         await ensureModel();
         hud.setStatus('info', 'Real depth from a photo. Hold to pour, scroll for depth.');
         return;
@@ -895,6 +1281,7 @@ async function main(): Promise<void> {
       // Measured from the same frame the depth came from, so a still, a clip
       // and the webcam all go down one path.
       sceneLight.encode(depthPass, cameraFrame);
+      vesselProbe.encode(depthPass);
       depthPass.end();
       lastDepthAt = now;
     }
@@ -940,7 +1327,9 @@ async function main(): Promise<void> {
     // Recount the water a few times a second. The readback is four bytes and
     // one map, but it lands a frame or two late, so a fresh request only goes
     // out once the last one is back.
-    if (medium === 'water' && !censusPending && now - lastCensusAt > 200) {
+    // Whatever tool is in hand - water in the scene is water in the scene, and
+    // a meter that freezes when you put the tap down reads as broken.
+    if (!censusPending && now - lastCensusAt > 200) {
       censusPending = true;
       lastCensusAt = now;
       void fluid.population
@@ -948,6 +1337,9 @@ async function main(): Promise<void> {
         .then(([count]) => {
           inScene = count;
           hud.setFill(inScene / PARTICLE_COUNT);
+        })
+        .catch(() => {
+          // A read in flight when the device is torn down aborts; expected.
         })
         .finally(() => {
           censusPending = false;
@@ -971,6 +1363,9 @@ async function main(): Promise<void> {
           hud.setTune('sunBearing', bearing);
           hud.setTune('sunHeight', height);
         })
+        .catch(() => {
+          // A read in flight when the device is torn down aborts; expected.
+        })
         .finally(() => {
           lightPending = false;
         });
@@ -988,6 +1383,10 @@ async function main(): Promise<void> {
           gravityRoll = (Math.atan2(down.x, down.y) * 180) / Math.PI;
           hud.setTune('gravityPitch', gravityPitch);
           hud.setTune('gravityRoll', gravityRoll);
+          showGravity();
+        })
+        .catch(() => {
+          // A read in flight when the device is torn down aborts; expected.
         })
         .finally(() => {
           gravityPending = false;
@@ -995,6 +1394,38 @@ async function main(): Promise<void> {
     }
 
     driveTorch(now);
+    driveTracking(now);
+
+    // While the drawer is open, keep the vessel outlines fresh: every basin
+    // the scene could hold liquid in, with how deep it can fill. On video the
+    // outlines track whatever the depth model sees frame to frame.
+    if (
+      !vesselPending &&
+      now - lastVesselAt > 600 &&
+      document.getElementById('tune')?.dataset.open === 'true'
+    ) {
+      vesselPending = true;
+      lastVesselAt = now;
+      void vesselProbe.buffer
+        .read()
+        .then((cells) => {
+          const pitch = (gravityPitch * Math.PI) / 180;
+          const roll = (gravityRoll * Math.PI) / 180;
+          drawVessels(
+            findVessels(
+              cells,
+              [Math.sin(roll) * Math.cos(pitch), Math.cos(roll) * Math.cos(pitch), -Math.sin(pitch)],
+              depthScaleNow,
+            ),
+          );
+        })
+        .catch(() => {
+          // A read in flight when the device is torn down aborts; expected.
+        })
+        .finally(() => {
+          vesselPending = false;
+        });
+    }
 
     if (storming) {
       driveStorm(now);
@@ -1002,15 +1433,20 @@ async function main(): Promise<void> {
 
     // Smoke steps once a frame. Semi-Lagrangian advection is stable at any step
     // size, so it takes the frame time rather than the solver's fixed tick.
-    if (medium === 'smoke' || smokeStale) {
+    // Once smoke exists it keeps living whatever tool is in hand; only a scene
+    // reset clears it.
+    if (smokeAlive || smokeStale) {
       const smokePass = encoder.beginComputePass();
-      if (medium === 'smoke') {
+      // Not either-or: after a scene change with the pour held, the old plume
+      // must be wiped and the new one stepped in the same frame.
+      if (smokeStale) {
+        smoke.clear(smokePass);
+        smokeStale = false;
+      }
+      if (smokeAlive) {
         driveSmoke(now);
         smoke.encode(smokePass, Math.min(elapsed, 1 / 30));
         smoke.encodeRender(smokePass);
-      } else {
-        smoke.clear(smokePass);
-        smokeStale = false;
       }
       smokePass.end();
     }
@@ -1035,7 +1471,9 @@ async function main(): Promise<void> {
     smoke.tune({
       emitterX: spoutX + Math.sin(time * 0.83) * 0.018 + Math.sin(time * 2.31) * 0.007,
       emitterY: spoutY + Math.sin(time * 1.27) * 0.012,
-      emitRate: smokeRate * (0.8 + 0.3 * Math.sin(time * 1.11) + 0.15 * Math.sin(time * 2.7)),
+      emitRate:
+        (pouringNow() && medium === 'smoke' ? smokeRate : 0) *
+        (0.8 + 0.3 * Math.sin(time * 1.11) + 0.15 * Math.sin(time * 2.7)),
     });
   }
 
@@ -1048,7 +1486,7 @@ async function main(): Promise<void> {
   function driveStorm(now: number): void {
     gust = Math.max(-0.5, Math.min(0.5, gust * 0.985 + (Math.random() - 0.5) * 0.05));
     fluid.tune({ wind: gust });
-    if (medium === 'smoke') {
+    if (smokeAlive) {
       smoke.tune({ wind: gust });
     }
 
@@ -1063,6 +1501,149 @@ async function main(): Promise<void> {
 
     flash *= 0.84;
     renderer.setFlash(flash < 0.004 ? 0 : flash);
+  }
+
+  /** Row-major forward maps matching rotationGeometry's matrices. */
+  const ROTATION_FORWARD = {
+    0: [1, 0, 0, 1],
+    90: [0, 1, -1, 0],
+    180: [-1, 0, 0, -1],
+    270: [0, -1, 1, 0],
+  } satisfies Record<number, readonly [number, number, number, number]>;
+
+  function ensureGestures(): void {
+    if (gestures || gesturesLoading) {
+      return;
+    }
+    gesturesLoading = true;
+    void import('./track/gestures.ts')
+      .then(async (mod) => {
+        gestures = await mod.createGestures();
+      })
+      .catch((error) => {
+        const reason = error instanceof Error ? error.message : String(error);
+        hud.setStatus('info', `Face and hand tracking unavailable: ${reason}`);
+      })
+      .finally(() => {
+        gesturesLoading = false;
+      });
+  }
+
+  /**
+   * Face and hand effects, run at video rate.
+   *
+   * The fingertip is a cursor: whatever tool is in hand follows it, and a
+   * pinch is the pour button. Sweat and tears are water sources pinned to the
+   * face itself - one emitter cycling around the springs at 120Hz reads as all
+   * of them running at once - and the auto-aim spawn clamp lands each drop ON
+   * the face, so it rolls down the real geometry.
+   */
+  function driveTracking(now: number): void {
+    if (sceneId !== 'camera' && sceneId !== 'clip') {
+      if (fingerPour) {
+        fingerPour = false;
+        applyFlow();
+      }
+      return;
+    }
+    ensureGestures();
+    if (!gestures) {
+      return;
+    }
+    const rotation = sceneId === 'camera' ? (rotationOverride ?? detectRotation(camera.track())) : 0;
+    tracked = gestures.read(
+      video,
+      {
+        mirror: sceneId === 'camera' ? (mirrorOverride ?? camera.facing === 'user') : false,
+        swapAxes: rotation === 90 || rotation === 270,
+        // SAFETY: rotation comes from rotationGeometry's domain - one of the
+        // four quarter turns - and the fallback covers anything else.
+        uv: ROTATION_FORWARD[rotation as 0 | 90 | 180 | 270] ?? ROTATION_FORWARD[0],
+      },
+      now,
+    );
+
+    const tip = handControl ? tracked.tip : undefined;
+    if (tip && !holding) {
+      hoverX = Math.min(Math.max(tip.x, 0.02), 0.98);
+      hoverY = Math.min(Math.max(tip.y, 0.02), 0.98);
+      if (medium === 'light') {
+        pushLights();
+        renderer.look({ spout: [hoverX, hoverY, spoutZ, 0.8] });
+      } else {
+        spoutX = hoverX;
+        spoutY = hoverY;
+        fluid.tune({ emitterX: spoutX, emitterY: spoutY });
+        smoke.tune({ emitterX: spoutX, emitterY: spoutY });
+        syncSpout();
+      }
+    }
+    const thumb = handControl ? tracked.thumb : undefined;
+    const pinched =
+      tip !== undefined &&
+      thumb !== undefined &&
+      Math.hypot(tip.x - thumb.x, tip.y - thumb.y) < 0.055;
+    if (pinched !== fingerPour) {
+      fingerPour = pinched;
+      applyFlow();
+    }
+
+    // Light-up glasses ride the irises, colour wheeling on its own.
+    if (glassesGlow > 0 && tracked.lenses.length === 2) {
+      const hue = (now / 25) % 360;
+      const h = hue / 60;
+      const x = 1 - Math.abs((h % 2) - 1);
+      const sector = Math.floor(h) % 6;
+      const wheel: [number, number, number][] = [
+        [1, x, 0], [x, 1, 0], [0, 1, x], [0, x, 1], [x, 0, 1], [1, 0, x],
+      ];
+      const [r, g, b] = wheel[sector];
+      renderer.look({
+        glassesA: [tracked.lenses[0].x, tracked.lenses[0].y, tracked.lenses[1].x, tracked.lenses[1].y],
+        glassesB: [r * 0.7 + 0.3, g * 0.7 + 0.3, b * 0.7 + 0.3, glassesGlow],
+      });
+      glassesOn = true;
+    } else if (glassesOn) {
+      glassesOn = false;
+      renderer.look({ glassesB: [1, 1, 1, 0] });
+    }
+
+    // The face's own water. It borrows the one fluid emitter whenever the user
+    // is not actively pouring, cycling it around the springs.
+    const springs: { x: number; y: number; rate: number }[] = [];
+    if (sweatRate > 0) {
+      const rate = sweatRate * (0.4 + 1.6 * tracked.effort);
+      for (const point of tracked.brow) {
+        springs.push({ x: point.x, y: point.y, rate });
+      }
+    }
+    if (tearRate > 0) {
+      for (const point of tracked.eyes) {
+        springs.push({ x: point.x, y: point.y, rate: tearRate });
+      }
+    }
+    const userPouring = storming || latched || holding || fingerPour;
+    if (springs.length > 0 && !userPouring) {
+      springStep = (springStep + 1) % springs.length;
+      const spring = springs[springStep];
+      faceOwned = true;
+      fluid.tune({
+        emitterX: Math.min(Math.max(spring.x, 0.02), 0.98),
+        emitterY: Math.min(Math.max(spring.y, 0.02), 0.98),
+        emitRate: Math.round(spring.rate),
+        emitSpread: 0.008,
+        emitSpeed: 0.05,
+      });
+    } else if (faceOwned) {
+      faceOwned = false;
+      fluid.tune({
+        emitterX: spoutX,
+        emitterY: spoutY,
+        emitSpread: defaultTuning.emitSpread,
+        emitSpeed: defaultTuning.emitSpeed,
+      });
+      applyFlow();
+    }
   }
 
   function frame(now: number): void {
@@ -1083,6 +1664,8 @@ async function main(): Promise<void> {
     // for driving the simulation from a headless check.
     Object.assign(globalThis, {
       probe: () => fluid.particles.read(),
+      tracked: () => tracked,
+      look: (next: Parameters<typeof renderer.look>[0]) => renderer.look(next),
       gravityDir: () => field.scene.read(),
       storm: () => ({ flash, gust }),
       smokeGrid: () => smoke.readCells(),
@@ -1107,6 +1690,8 @@ async function main(): Promise<void> {
 
   applyFlow();
   syncSpout();
+  document.body.dataset.tool = medium;
+  hud.setToolFilter(medium);
   hud.setFill(0);
   hud.setStatus('info', `${PARTICLE_COUNT.toLocaleString()} particles. Hold to pour.`);
   requestAnimationFrame(frame);

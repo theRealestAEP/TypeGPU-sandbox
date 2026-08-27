@@ -21,10 +21,19 @@ export const simLayout = tgpu.bindGroupLayout({
   surfacePrev: { texture: d.texture2d(d.f32) },
   /** Where the surface stands right now. Everything collides against this. */
   surfaceLive: { texture: d.texture2d(d.f32) },
+  /** The scene with passing occluders forgotten; the floor under a hand. */
+  surfaceBack: { texture: d.texture2d(d.f32) },
   /** Which way is down, and how far the whole surface drifted this update. */
   scene: { storage: SceneState, access: 'readonly' },
   /** Particles in the scene, recounted each step. Drives the fill meter. */
   population: { storage: d.arrayOf(d.atomic(d.u32)), access: 'mutable' },
+  /**
+   * Per-particle calm, remembered across steps. The instantaneous estimate
+   * flickers with tilt noise exactly where the eye looks - the contact bulges -
+   * and every flicker wakes gravity for a step. An EMA needs somewhere to
+   * live, and deltas.w is overwritten by the solver each iteration.
+   */
+  calms: { storage: d.arrayOf(d.f32), access: 'mutable' },
   fieldSampler: { sampler: 'filtering' },
 });
 

@@ -33,3 +33,13 @@ moving per frame. That is four kittens actively playing rather than asleep.
 
 The room also suits monocular depth: a wooden floor running away from the camera,
 a staircase, and props at several distances give the model real gradation to find.
+
+dishes.webm: "wash dish" by Penguin Hermit, youtube.com/watch?v=uSyghtb7d8E,
+Creative Commons Attribution (CC-BY). Trimmed, cropped square, re-encoded.
+
+kitchen.jpg: "Extractor-hood.jpg", Wikimedia Commons, copyrighted free use.
+Cropped square.
+
+city.webm: "square street traffic bird eye day light 01" by ShortsXpress,
+youtube.com/watch?v=zhM1pMML-2g, Creative Commons Attribution (CC-BY).
+Trimmed, cropped square, re-encoded.
