@@ -119,6 +119,15 @@ interface Scenario {
   readonly spout: readonly [number, number];
   /** Spout depth. Near the camera keeps water in front of foreground subjects. */
   readonly spoutZ?: number;
+  /** Fluid gravity. Zero leaves emitted liquid floating in place. */
+  readonly gravity?: number;
+  readonly emitSpeed?: number;
+  readonly emitSpread?: number;
+  readonly cohesion?: number;
+  readonly viscosity?: number;
+  /** Pin down for footage whose inferred camera pitch is ambiguous. */
+  readonly gravityPitch?: number;
+  readonly gravityRoll?: number;
   /** A still of its own; scenarios without one share the default photo. */
   readonly photo?: string;
   /** A clip of its own; scenarios without one share the default clip. */
@@ -171,6 +180,40 @@ const SCENARIOS: readonly Scenario[] = [
     smoke: 0,
     spout: [0.5, 0.06],
     look: { caustics: 1.0, foam: 10, scatter: 0.14 },
+  },
+  {
+    id: 'orbit',
+    label: 'Zero gravity',
+    note: 'clip - liquid floats through the ISS',
+    scene: 'clip',
+    clip: '/zero-g.webm',
+    storm: false,
+    medium: 'water',
+    gravity: 0,
+    emitSpeed: 0.04,
+    emitSpread: 0.04,
+    cohesion: 6e-5,
+    viscosity: 0.16,
+    flow: 16,
+    smoke: 0,
+    spout: [0.5, 0.24],
+    spoutZ: Z_MAX * 0.78,
+    look: { caustics: 1.2, foam: 2, refraction: 0.16, reflection: 0.18, scatter: 0.2 },
+  },
+  {
+    id: 'skate',
+    label: 'Flood the bowl',
+    note: 'clip - a skater cuts through the pool',
+    scene: 'clip',
+    clip: '/skate-bowl.webm',
+    storm: false,
+    medium: 'water',
+    gravityPitch: 55,
+    flow: 90,
+    smoke: 0,
+    spout: [0.5, 0.1],
+    spoutZ: Z_MAX * 0.88,
+    look: { caustics: 0.9, foam: 14, refraction: 0.1, reflection: 0.2, scatter: 0.12 },
   },
   {
     id: 'downpour',
@@ -658,11 +701,21 @@ async function main(): Promise<void> {
         hud.setStorm(scenario.storm);
         fluid.tune({
           storm: scenario.storm,
+          gravity: scenario.gravity ?? defaultTuning.gravity,
+          emitSpeed: scenario.emitSpeed ?? defaultTuning.emitSpeed,
+          emitSpread: scenario.emitSpread ?? defaultTuning.emitSpread,
+          cohesion: scenario.cohesion ?? defaultTuning.cohesion,
+          viscosity: scenario.viscosity ?? defaultTuning.viscosity,
           emitterX: spoutX,
           emitterY: spoutY,
           emitterZ: spoutZ,
           wind: 0,
         });
+        hud.setTune('gravity', scenario.gravity ?? defaultTuning.gravity);
+        hud.setTune('emitSpeed', scenario.emitSpeed ?? defaultTuning.emitSpeed);
+        hud.setTune('emitSpread', scenario.emitSpread ?? defaultTuning.emitSpread);
+        hud.setTune('cohesion', scenario.cohesion ?? defaultTuning.cohesion);
+        hud.setTune('viscosity', scenario.viscosity ?? defaultTuning.viscosity);
         smoke.tune({ emitterX: spoutX, emitterY: spoutY, emitterZ: spoutZ, wind: 0 });
         renderer.look(scenario.look);
         if (scenario.smoke > 0) {
@@ -676,8 +729,6 @@ async function main(): Promise<void> {
         applyFlow();
         syncSpout();
         hud.dismissHint();
-        gravityManual = false;
-        field.tune({ manual: false });
         const nextPhoto = scenario.photo ?? PHOTO_URL;
         const photoChanged = scenario.scene === 'photo' && nextPhoto !== photoUrl;
         photoUrl = nextPhoto;
@@ -689,6 +740,10 @@ async function main(): Promise<void> {
           hud.setScene(scenario.scene);
           void selectScene(scenario.scene);
         }
+        gravityManual = scenario.gravityPitch !== undefined;
+        gravityPitch = scenario.gravityPitch ?? 0;
+        gravityRoll = scenario.gravityRoll ?? 0;
+        field.tune({ manual: gravityManual, pitch: gravityPitch, roll: gravityRoll });
       },
       onDrain: () => resetScene(),
       onTune: (key, value) => {

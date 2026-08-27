@@ -793,7 +793,7 @@ export const defaultSmokeTuning: SmokeTuning = {
   cooling: 0.5,
   // Slow decay: smoke that lingers is what fills the volume and rolls. Fast
   // decay leaves only the fresh core, which is exactly the thin-haze look.
-  dissipation: 0.09,
+  dissipation: 0.045,
   wind: 0,
   swirl: 30,
   drag: 0.1,

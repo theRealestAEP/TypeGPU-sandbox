@@ -43,3 +43,13 @@ Cropped square.
 city.webm: "square street traffic bird eye day light 01" by ShortsXpress,
 youtube.com/watch?v=zhM1pMML-2g, Creative Commons Attribution (CC-BY).
 Trimmed, cropped square, re-encoded.
+
+zero-g.webm: "#Tokyo2020: Highlights from the first-ever space Olympics!" by
+NASA, https://images.nasa.gov/details/Tokyo2020%20Highlights%20from%20the%20first%20ever%20space%20Olympics.
+NASA media. One continuous ISS shot, cropped square, played forward and backward
+for a seamless six-second loop, re-encoded without audio.
+
+skate-bowl.webm: "A Man Skateboarding in the Skatepark" by cottonbro studio,
+https://www.pexels.com/video/a-man-skateboarding-in-the-skatepark-8401859/.
+Pexels Content License. Cropped square, scaled to 640 px, re-encoded without
+audio.

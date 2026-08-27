@@ -6,6 +6,15 @@ basins fill, plumes climb walls, and the liquid refracts the image behind it.
 
 Built on [TypeGPU](https://docs.swmansion.com/TypeGPU/) (WebGPU in TypeScript).
 
+## How each thing is rendered, in one line
+
+- **Water** - particles splat into a screen-space surface, which is shaded with
+  refraction, absorption and reflections of the real image.
+- **Smoke** - a density grid is ray-marched front to back, lit by baked sun
+  shadows and sky occlusion.
+- **Light** - analytic point lamps shade the scene's depth-derived normals;
+  nothing is path-traced.
+
 ## Run it
 
 ```sh

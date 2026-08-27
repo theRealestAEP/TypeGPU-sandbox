@@ -676,8 +676,9 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
     if (a.w > 0.001) {
       const orbAt = d.vec2f(a.x, a.y);
       const orbSpan = std.length(uv - orbAt);
-      const orbSize = d.f32(0.007);
-      if (orbSpan < orbSize * 2.4) {
+      // Generous pre-test with the largest size an orb can reach, so the
+      // texture samples below only run near a lamp at all.
+      if (orbSpan < 0.022 * 2.4) {
         const b = look.lightsB[slot];
         // Explicit-level samples: this branch is per-pixel, and implicit
         // derivatives are not allowed in non-uniform control flow.
@@ -688,6 +689,10 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
           compositeLayout.$.scene, compositeLayout.$.linear, orbAt, 0,
         ).x * compositeLayout.$.field.depthScale;
         const orbZ = std.max(a.z, backHere + 0.06);
+        // Size follows depth, the one perspective cue an orthographic composite
+        // can still give: a lamp by the camera is a bulb, one across the room a
+        // distant point.
+        const orbSize = d.f32(0.0045) + orbZ * 0.011;
         const core = std.exp(-(orbSpan * orbSpan) / (orbSize * orbSize * 0.55));
         let solidity = std.saturate(core * 2) * std.min(a.w, 1.2);
         if (liveHere > orbZ + 0.05) {

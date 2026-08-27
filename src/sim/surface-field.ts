@@ -49,7 +49,9 @@ const scatterOff = tgpu.workgroupVar(d.arrayOf(d.vec3f, ORIENT_THREADS));
 const seedDown = tgpu.workgroupVar(d.vec3f);
 const driftShared = tgpu.workgroupVar(d.f32);
 const groundSums = tgpu.workgroupVar(d.arrayOf(d.f32, ORIENT_THREADS));
+const groundVecs = tgpu.workgroupVar(d.arrayOf(d.vec3f, ORIENT_THREADS));
 const groundShare = tgpu.workgroupVar(d.f32);
+const groundTight = tgpu.workgroupVar(d.f32);
 /** Per-thread advance of the surface since the last update, for the mean. */
 const driftSums = tgpu.workgroupVar(d.arrayOf(d.f32, ORIENT_THREADS));
 
@@ -195,6 +197,7 @@ const orientKernel = tgpu.computeFn({
   let offDiagonal = d.vec3f();
   let driftSum = d.f32(0);
   let groundSum = d.f32(0);
+  let groundVec = d.vec3f();
   for (const step of std.range(ORIENT_STRIDE)) {
     const index = lid * ORIENT_STRIDE + step;
     if (index < FIELD_RES * FIELD_RES) {
@@ -209,6 +212,7 @@ const orientKernel = tgpu.computeFn({
       // all - a webcam full of wall and face has none.
       if (normal.y < -0.12) {
         groundSum += 1;
+        groundVec = groundVec + normal;
       }
       diagonal = diagonal + normal * normal;
       offDiagonal = offDiagonal +
@@ -219,6 +223,7 @@ const orientKernel = tgpu.computeFn({
   scatterOff.$[lid] = d.vec3f(offDiagonal);
   driftSums.$[lid] = driftSum;
   groundSums.$[lid] = groundSum;
+  groundVecs.$[lid] = d.vec3f(groundVec);
   std.workgroupBarrier();
 
   if (lid === 0) {
@@ -232,10 +237,15 @@ const orientKernel = tgpu.computeFn({
     }
     driftShared.$ = driftTotal / d.f32(FIELD_RES * FIELD_RES);
     let groundTotal = d.f32(0);
+    let groundDir = d.vec3f();
     for (const slot of std.range(ORIENT_THREADS)) {
       groundTotal += groundSums.$[slot];
+      groundDir = groundDir + groundVecs.$[slot];
     }
     groundShare.$ = groundTotal / d.f32(FIELD_RES * FIELD_RES);
+    // Mean resultant length: 1 when every ground normal agrees, small when
+    // they scatter. A floor is coherent; a face is not.
+    groundTight.$ = std.length(groundDir) / std.max(groundTotal, 1);
 
     // The frame: biggest cluster, then the biggest of what is left, then the
     // one square to both.
@@ -322,13 +332,15 @@ const orientKernel = tgpu.computeFn({
       );
     }
 
-    // Steepness has to be earned. The frame fit always produces SOME axis,
-    // and on a scene with no visible ground - a webcam full of face and wall -
-    // that axis is fitted noise, which once read as 68 degrees into the scene
-    // with 53 of roll on a level laptop camera. A camera is level far more
-    // often than not, so that is the prior, and the measurement only moves it
-    // as far as the visible ground area supports.
-    const confidence = std.saturate((groundShare.$ - 0.02) / 0.06);
+    // Steepness has to be earned twice over. The frame fit always produces
+    // SOME axis, and area alone is not evidence: a webcam frame full of face,
+    // shoulders and house plant has plenty of texels leaning up-image, and
+    // they once read as the camera pointing 68 degrees into a level room. Real
+    // ground is not merely present, it is COHERENT - every floor texel's
+    // normal points the same way, while a face's scatter over a hemisphere.
+    // The prior is a level camera, and only abundant, agreeing ground moves it.
+    const confidence = std.saturate((groundShare.$ - 0.05) / 0.1) *
+      std.saturate((groundTight.$ - 0.7) / 0.2);
     down = std.normalize(std.mix(d.vec3f(0, 1, 0), down, confidence));
 
     // Cap the lean into the scene. Past this the fit is more likely to have
