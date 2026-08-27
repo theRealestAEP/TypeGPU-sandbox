@@ -147,32 +147,6 @@ const SCENARIOS: readonly Scenario[] = [
     look: { caustics: 0.4, foam: 6, scatter: 0.1 },
   },
   {
-    id: 'kittens',
-    label: 'Washing up',
-    note: 'clip - hands in the stream',
-    scene: 'clip',
-    storm: false,
-    medium: 'water',
-    flow: 70,
-    smoke: 0,
-    spout: [0.55, 0.12],
-    spoutZ: Z_MAX * 0.88,
-    look: { caustics: 0.7, foam: 6, scatter: 0.14 },
-  },
-  {
-    id: 'flood',
-    label: 'Flood the city',
-    note: 'clip - rain on a junction',
-    scene: 'clip',
-    clip: '/city.webm',
-    storm: true,
-    medium: 'water',
-    flow: 80,
-    smoke: 0,
-    spout: [0.5, 0.06],
-    look: { caustics: 1.0, foam: 10, scatter: 0.14 },
-  },
-  {
     id: 'downpour',
     label: 'Downpour',
     note: 'photo - rain and lightning',
@@ -194,8 +168,11 @@ const SCENARIOS: readonly Scenario[] = [
     medium: 'smoke',
     flow: 45,
     smoke: 4,
-    // On the hob, so the plume climbs into the extractor's underside.
+    // On the hob, and DEEP at it: left at the near-camera default depth the
+    // plume rose in front of the hood and drew over it. At the hob's own depth
+    // it mushrooms against the underside, which is the whole demo.
     spout: [0.55, 0.87],
+    spoutZ: 0.4,
     look: { caustics: 0.6, foam: 8, scatter: 0.18 },
   },
   {
@@ -440,6 +417,14 @@ async function main(): Promise<void> {
   let lastDepthAt = 0;
   /** Seconds between the last two depth updates; drives obstacle-motion contact. */
   let obstacleDt = 1 / 30;
+  /**
+   * While a scene is loading, the video element and the depth texture still
+   * hold the OLD scene, and every depth update the estimator ran against them
+   * re-converged gravity toward a scene the user had already left. Freezing
+   * the depth pipeline until the new source is actually delivering frames is
+   * what makes a scene change start clean.
+   */
+  let sceneLoading = false;
   let accumulator = 0;
   let previousTime = performance.now();
   let emitRate = defaultTuning.emitRate;
@@ -1202,6 +1187,7 @@ async function main(): Promise<void> {
   async function selectScene(next: SceneId): Promise<void> {
     const previous = sceneId;
     sceneId = next;
+    sceneLoading = true;
     document.body.dataset.scene = next;
     hud.setSceneFilter(next);
     // A webcam is near level; a photo or clip can be shot from anywhere.
@@ -1251,6 +1237,8 @@ async function main(): Promise<void> {
       camera.stop();
       const reason = error instanceof Error ? error.message : String(error);
       hud.setStatus('error', `Could not switch: ${reason}`);
+    } finally {
+      sceneLoading = false;
     }
   }
 
@@ -1273,7 +1261,7 @@ async function main(): Promise<void> {
     const source = activeSource();
     const encoder = root['~unstable'].createCommandEncoder();
 
-    if (now - lastDepthAt >= source.minIntervalMs) {
+    if (!sceneLoading && now - lastDepthAt >= source.minIntervalMs) {
       if (lastDepthAt > 0) {
         obstacleDt = Math.min(Math.max((now - lastDepthAt) / 1000, 1 / 240), 1 / 10);
       }
