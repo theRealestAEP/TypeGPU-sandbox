@@ -218,6 +218,8 @@ export const FieldParams = d.struct({
    */
   manual: d.u32,
   manualDown: d.vec3f,
+  /** sin of the steepest pitch the measurement may report for this source. */
+  maxDownZ: d.f32,
 });
 
 /**

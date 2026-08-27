@@ -343,6 +343,23 @@ const orientKernel = tgpu.computeFn({
       std.saturate((groundTight.$ - 0.7) / 0.2);
     down = std.normalize(std.mix(d.vec3f(0, 1, 0), down, confidence));
 
+    // The source's own prior caps the pitch outright. Three rounds of ever
+    // smarter statistical gating still read one real webcam as pointing sixty
+    // degrees into a level room, because a face plus a desk slice can satisfy
+    // any test built from normals alone. A webcam IS near level - that is a
+    // fact about how laptops are used, not about this frame - so the camera
+    // source refuses steep answers entirely and leaves the rare exception to
+    // the manual pin, which still overrides everything below.
+    if (-down.z > orientLayout.$.params.maxDownZ) {
+      const tilt = std.atan2(down.x, down.y);
+      const flat = std.sqrt(1 - orientLayout.$.params.maxDownZ * orientLayout.$.params.maxDownZ);
+      down = d.vec3f(
+        std.sin(tilt) * flat,
+        std.cos(tilt) * flat,
+        -orientLayout.$.params.maxDownZ,
+      );
+    }
+
     // Cap the lean into the scene. Past this the fit is more likely to have
     // locked onto a wall than onto genuinely overhead geometry.
     if (std.abs(down.z) > MAX_INTO_SCENE) {
@@ -373,6 +390,8 @@ const orientKernel = tgpu.computeFn({
 
 export interface FieldTuning {
   depthScale: number;
+  /** Steepest pitch, in degrees, the measurement may report. */
+  maxPitch: number;
   /** Pin gravity instead of measuring it. */
   manual: boolean;
   /** Degrees the camera looks below level. */
@@ -383,6 +402,7 @@ export interface FieldTuning {
 
 export const defaultFieldTuning: FieldTuning = {
   depthScale: MAX_DEPTH_SCALE,
+  maxPitch: 85,
   manual: false,
   pitch: 0,
   roll: 0,
@@ -435,6 +455,7 @@ export function createSurfaceField(
       depthScale: defaultFieldTuning.depthScale,
       manual: 0,
       manualDown: downFromAngles(0, 0),
+      maxDownZ: Math.sin((defaultFieldTuning.maxPitch * Math.PI) / 180),
     })
     .$usage('uniform');
   const scene = root
@@ -606,6 +627,7 @@ export function createSurfaceField(
         depthScale: tuning.depthScale,
         manual: tuning.manual ? 1 : 0,
         manualDown: [x, y, z],
+        maxDownZ: Math.sin((tuning.maxPitch * Math.PI) / 180),
       });
     },
 
