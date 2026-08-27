@@ -22,10 +22,10 @@ import { FIELD_RES } from '../sim/schemas.ts';
 const MAX_CUPS = 3;
 
 /** Fraction of the box width kept as wall on each side. */
-const WALL = 0.14;
+export const WALL = 0.14;
 /** Fraction of the box height kept as rim at the top and base at the bottom. */
-const RIM = 0.06;
-const BASE = 0.12;
+export const RIM = 0.06;
+export const BASE = 0.12;
 
 const carveLayout = tgpu.bindGroupLayout({
   /** Boxes in field space: x0, y0, x1, y1. Empty slots have x1 <= x0. */

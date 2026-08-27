@@ -195,17 +195,33 @@ const frameLayout = tgpu.bindGroupLayout({
 const cameraSlot = tgpu.slot<boolean>();
 
 const splatVertex = tgpu.vertexFn({
-  in: { pos: d.vec3f, vertex: d.builtin.vertexIndex },
+  in: { pos: d.vec3f, vel: d.vec3f, vertex: d.builtin.vertexIndex },
   out: { position: d.builtin.position, offset: d.vec2f, centre: d.f32 },
-})(({ pos, vertex }) => {
+})(({ pos, vel, vertex }) => {
   'use gpu';
   const corner = quadCorners.$[vertex];
   const centre = d.vec3f(pos);
   const radius = splatLayout.$.splat.radius;
 
+  // Fast water stretches along its motion. A stream one particle wide - a
+  // pour in flight, a runnel down the tub's front - rendered as round beads
+  // is a dotted line: the beads never merge, coverage stays under the surface
+  // gate, and the water is invisible exactly where it moves. Elongating each
+  // splat into its neighbour turns the dots into one glassy streak. Resting
+  // water is untouched; the stretch only wakes above walking pace.
+  const speed = std.length(vel.xy);
+  const stretch = std.min(std.max(speed - 0.15, 0) * 0.08, radius * 5);
+  let along = d.vec2f(0, 1);
+  if (speed > 1e-4) {
+    along = vel.xy / speed;
+  }
+  const across = d.vec2f(-along.y, along.x);
+
   // Image space is the unit square with y down; clip space is [-1, 1] with y up,
   // so a world radius spans twice as much clip space.
-  const point = centre.xy + corner * radius;
+  const point = centre.xy +
+    along * (corner.x * (radius + stretch)) +
+    across * (corner.y * radius);
   return {
     position: d.vec4f(point.x * 2 - 1, 1 - point.y * 2, 0.5, 1),
     offset: d.vec2f(corner),
@@ -942,7 +958,7 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
   });
 
   const depthPipeline = root.createRenderPipeline({
-    attribs: { pos: particleLayout.attrib.pos },
+    attribs: { pos: particleLayout.attrib.pos, vel: particleLayout.attrib.vel },
     vertex: splatVertex,
     fragment: splatDepthFragment,
     targets: { surface: { format: 'rgba16float' } },
@@ -954,7 +970,7 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
   });
 
   const thicknessPipeline = root.createRenderPipeline({
-    attribs: { pos: particleLayout.attrib.pos },
+    attribs: { pos: particleLayout.attrib.pos, vel: particleLayout.attrib.vel },
     vertex: splatVertex,
     fragment: splatThicknessFragment,
     targets: {

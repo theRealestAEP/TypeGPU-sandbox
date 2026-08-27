@@ -30,6 +30,7 @@ import {
   poly6Coefficient,
   spikyCoefficient,
 } from './schemas.ts';
+import { BASE, WALL } from '../depth/carve.ts';
 import type { ParticleBuffer } from './schemas.ts';
 
 /** Keeps particles a hair inside the side walls and the front plane. */
@@ -566,23 +567,28 @@ const finalizeKernel = tgpu.computeFn({
   // under a level camera gravity has no into-scene component, so pool pressure
   // squeezes settled water out toward the viewer, where it free-falls off the
   // glass. Measured: 70% of a full glass drained within four seconds of the
-  // pour stopping. So inside each cup box, over carved texels only, water that
-  // was behind the vessel's front plane stays behind it: a one-way wall, using
-  // the previous position so water already in front of the glass is left alone.
+  // pour stopping. So across each cup's interior span - the same margins the
+  // carve keeps - water that was behind the vessel's front plane stays behind
+  // it: a one-way wall, judged on the previous position so water already in
+  // front of the glass is left alone. The span is geometric, not read from the
+  // carved surface: the bowl's perimeter ramps taper to nothing, and gating
+  // the wall on carved depth left that whole ring open - the pool's rim
+  // squeezed out through it and the glass drained anyway.
   for (const slot of std.range(3)) {
     const cup = params.cups[slot];
     if (cup.z <= cup.x) {
       continue;
     }
+    const width = cup.z - cup.x;
+    const height = cup.w - cup.y;
     const wall = params.cupFronts[slot] * params.depthScale - params.kernelRadius * 0.5;
     if (
-      position.x > cup.x &&
-      position.x < cup.z &&
+      position.x > cup.x + width * d.f32(WALL) &&
+      position.x < cup.z - width * d.f32(WALL) &&
       position.y > cup.y &&
-      position.y < cup.w &&
+      position.y < cup.w - height * d.f32(BASE) &&
       position.z > wall &&
-      particle.prev.z < wall &&
-      surfaceAt(position.xy) < wall - params.kernelRadius
+      particle.prev.z < wall
     ) {
       position = d.vec3f(position.xy, wall);
     }
