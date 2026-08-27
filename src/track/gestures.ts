@@ -74,6 +74,8 @@ const EYE_MARKS = [153, 380];
 export interface Gestures {
   /** Runs both trackers against the video's current frame. */
   read(video: HTMLVideoElement, fit: FrameFit, now: number): Tracked;
+  /** Runs only the vessel detector, for still photos. */
+  readStill(image: HTMLCanvasElement, fit: FrameFit, now: number): Tracked;
   destroy(): void;
 }
 
@@ -142,6 +144,87 @@ export async function createGestures(): Promise<Gestures> {
     return { x, y };
   }
 
+  /**
+   * The vessel detector, shared by video frames and still photos. It runs a
+   * few times a second; a held cup moves at hand speed, and the persistence
+   * smoothing absorbs the gap.
+   */
+  function findVessels(
+    source: HTMLVideoElement | HTMLCanvasElement,
+    w: number,
+    h: number,
+    fit: FrameFit,
+    now: number,
+  ): void {
+    if (now - lastDetectAt < DETECT_EVERY_MS) {
+      return;
+    }
+    lastDetectAt = now;
+    const found = finder.detectForVideo(source, now);
+
+      const fresh: HeldVessel[] = [];
+      for (const detection of found.detections) {
+        const category = detection.categories[0];
+        const box = detection.boundingBox;
+        if (!category || !box || !VESSEL_CLASSES.has(category.categoryName)) {
+          continue;
+        }
+        const a = toField({ x: box.originX / w, y: box.originY / h }, fit, w, h);
+        const b = toField(
+          { x: (box.originX + box.width) / w, y: (box.originY + box.height) / h },
+          fit,
+          w,
+          h,
+        );
+        fresh.push({
+          x0: Math.min(a.x, b.x),
+          y0: Math.min(a.y, b.y),
+          x1: Math.max(a.x, b.x),
+          y1: Math.max(a.y, b.y),
+          label: category.categoryName,
+        });
+      }
+      // Persistence over confidence. The threshold above is low enough to
+      // let genuine close-up glasses through, so single-round noise gets in
+      // too; requiring three consecutive rounds keeps phantom cups from
+      // carving cavities into the scene. The other direction gets grace as
+      // well - a vessel survives two missed rounds - because every
+      // appear/disappear flap re-digs the carve, and that quake throws the
+      // water it held. Matched boxes ease toward the new detection.
+      const matched = new Set<number>();
+      for (const candidate of candidates) {
+        const index = fresh.findIndex(
+          (next, i) =>
+            !matched.has(i) &&
+            Math.abs(candidate.x0 - next.x0) < 0.15 &&
+            Math.abs(candidate.y0 - next.y0) < 0.15,
+        );
+        if (index >= 0) {
+          matched.add(index);
+          const next = fresh[index];
+          const ease = 0.55;
+          candidate.x0 += (next.x0 - candidate.x0) * ease;
+          candidate.y0 += (next.y0 - candidate.y0) * ease;
+          candidate.x1 += (next.x1 - candidate.x1) * ease;
+          candidate.y1 += (next.y1 - candidate.y1) * ease;
+          candidate.label = next.label;
+          candidate.streak += 1;
+          candidate.misses = 0;
+        } else {
+          candidate.misses += 1;
+        }
+      }
+      candidates = candidates.filter((candidate) => candidate.misses <= 2);
+      fresh.forEach((next, i) => {
+        if (!matched.has(i)) {
+          candidates.push({ ...next, streak: 1, misses: 0 });
+        }
+      });
+      heldVessels = candidates
+        .filter((candidate) => candidate.streak >= 3)
+        .map(({ x0, y0, x1, y1, label }) => ({ x0, y0, x1, y1, label }));
+  }
+
   return {
     read(video, fit, now) {
       if (video.readyState < 2) {
@@ -160,73 +243,7 @@ export async function createGestures(): Promise<Gestures> {
       const faces = face.detectForVideo(video, now);
       const palms = hands.detectForVideo(video, now);
 
-      // The vessel detector runs a few times a second; a held cup moves at
-      // hand speed, and the smoothing below absorbs the gap.
-      if (now - lastDetectAt >= DETECT_EVERY_MS) {
-        lastDetectAt = now;
-        const found = finder.detectForVideo(video, now);
-        const fresh: HeldVessel[] = [];
-        for (const detection of found.detections) {
-          const category = detection.categories[0];
-          const box = detection.boundingBox;
-          if (!category || !box || !VESSEL_CLASSES.has(category.categoryName)) {
-            continue;
-          }
-          const a = toField({ x: box.originX / w, y: box.originY / h }, fit, w, h);
-          const b = toField(
-            { x: (box.originX + box.width) / w, y: (box.originY + box.height) / h },
-            fit,
-            w,
-            h,
-          );
-          fresh.push({
-            x0: Math.min(a.x, b.x),
-            y0: Math.min(a.y, b.y),
-            x1: Math.max(a.x, b.x),
-            y1: Math.max(a.y, b.y),
-            label: category.categoryName,
-          });
-        }
-        // Persistence over confidence. The threshold above is low enough to
-        // let genuine close-up glasses through, so single-round noise gets in
-        // too; requiring three consecutive rounds keeps phantom cups from
-        // carving cavities into the scene. The other direction gets grace as
-        // well - a vessel survives two missed rounds - because every
-        // appear/disappear flap re-digs the carve, and that quake throws the
-        // water it held. Matched boxes ease toward the new detection.
-        const matched = new Set<number>();
-        for (const candidate of candidates) {
-          const index = fresh.findIndex(
-            (next, i) =>
-              !matched.has(i) &&
-              Math.abs(candidate.x0 - next.x0) < 0.15 &&
-              Math.abs(candidate.y0 - next.y0) < 0.15,
-          );
-          if (index >= 0) {
-            matched.add(index);
-            const next = fresh[index];
-            const ease = 0.55;
-            candidate.x0 += (next.x0 - candidate.x0) * ease;
-            candidate.y0 += (next.y0 - candidate.y0) * ease;
-            candidate.x1 += (next.x1 - candidate.x1) * ease;
-            candidate.y1 += (next.y1 - candidate.y1) * ease;
-            candidate.label = next.label;
-            candidate.streak += 1;
-            candidate.misses = 0;
-          } else {
-            candidate.misses += 1;
-          }
-        }
-        candidates = candidates.filter((candidate) => candidate.misses <= 2);
-        fresh.forEach((next, i) => {
-          if (!matched.has(i)) {
-            candidates.push({ ...next, streak: 1, misses: 0 });
-          }
-        });
-        heldVessels = candidates
-          .filter((candidate) => candidate.streak >= 3)
-          .map(({ x0, y0, x1, y1, label }) => ({ x0, y0, x1, y1, label }));
-      }
+      findVessels(video, w, h, fit, now);
 
       const map = (p: { x: number; y: number }) => toField(p, fit, w, h);
       let tip: TrackedPoint | undefined;
@@ -266,6 +283,12 @@ export async function createGestures(): Promise<Gestures> {
       }
 
       held = { vessels: heldVessels, tip, thumb, brow, eyes, lenses, effort };
+      return held;
+    },
+
+    readStill(image, fit, now) {
+      findVessels(image, image.width, image.height, fit, now);
+      held = { vessels: heldVessels, brow: [], eyes: [], lenses: [], effort: 0 };
       return held;
     },
 

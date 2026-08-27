@@ -1610,7 +1610,39 @@ async function main(): Promise<void> {
 
   }
 
+  /** The dropped photo drawn once for the detector; keyed by its cache id. */
+  let stillCanvas: HTMLCanvasElement | undefined;
+  let stillKey = '';
+
   function driveTracking(now: number): void {
+    if (sceneId === 'photo') {
+      // A glass in a dropped photo deserves an interior as much as one held
+      // to the camera. Only the vessel detector runs - there is no face to
+      // track on a still that never changes - but it must KEEP running: the
+      // persistence rule needs its three consecutive rounds, and the carve
+      // needs the box refreshed if a new photo lands.
+      const bitmap = photoCache.get(photoUrl);
+      if (!bitmap) {
+        return;
+      }
+      ensureGestures();
+      if (!gestures) {
+        return;
+      }
+      if (stillKey !== photoUrl || !stillCanvas) {
+        stillCanvas = document.createElement('canvas');
+        stillCanvas.width = bitmap.width;
+        stillCanvas.height = bitmap.height;
+        stillCanvas.getContext('2d')?.drawImage(bitmap, 0, 0);
+        stillKey = photoUrl;
+      }
+      tracked = gestures.readStill(
+        stillCanvas,
+        { mirror: false, swapAxes: false, uv: [1, 0, 0, 1] },
+        now,
+      );
+      return;
+    }
     if (sceneId !== 'camera' && sceneId !== 'clip') {
       if (fingerPour) {
         fingerPour = false;
