@@ -2,6 +2,7 @@ import { d, tgpu } from 'typegpu';
 import { ROTATIONS, createCameraSession, detectRotation, rotationGeometry } from './camera.ts';
 import type { Rotation } from './camera.ts';
 import type { CameraFrame, DepthSource } from './depth/depth-field.ts';
+import { createCarver } from './depth/carve.ts';
 import { createSceneLight } from './depth/lighting.ts';
 import type { Gestures, Tracked } from './track/gestures.ts';
 import { type Vessel, createVesselProbe, findVessels } from './depth/vessels.ts';
@@ -324,6 +325,7 @@ async function main(): Promise<void> {
   const field = createSurfaceField(root, depth, linear);
   const sceneLight = createSceneLight(root, field.surface, linear);
   const vesselProbe = createVesselProbe(root, field.surface, linear);
+  const carver = createCarver(root, depth);
   const fluid = createFluid(root, {
     surface: field.surface,
     surfacePrev: field.surfacePrev,
@@ -565,6 +567,8 @@ async function main(): Promise<void> {
   let lastGravityAt = 0;
   /** The vessel probe re-floods a downsample of the scene while tuning. */
   let vesselPending = false;
+  /** Latest probe cells, reused to read a held vessel's front depth. */
+  let probeCells: number[] | undefined;
   let lastVesselAt = 0;
   let depthScaleNow = defaultTuning.depthScale;
 
@@ -773,6 +777,7 @@ async function main(): Promise<void> {
     smoke.initAsync(),
     sceneLight.initAsync(),
     vesselProbe.initAsync(),
+    carver.initAsync(),
     renderer.initAsync(),
   ]);
 
@@ -1267,6 +1272,9 @@ async function main(): Promise<void> {
       }
       const depthPass = encoder.beginComputePass();
       source.encode(depthPass, cameraFrame);
+      // Detected vessels get their interiors before anything downstream reads
+      // the depth: from here on, the glass IS hollow.
+      carver.encode(depthPass);
       field.encode(depthPass);
       // Measured from the same frame the depth came from, so a still, a clip
       // and the webcam all go down one path.
@@ -1385,6 +1393,7 @@ async function main(): Promise<void> {
 
     driveTorch(now);
     driveTracking(now);
+    driveCups();
 
     // While the drawer is open, keep the vessel outlines fresh: every basin
     // the scene could hold liquid in, with how deep it can fill. On video the
@@ -1392,13 +1401,15 @@ async function main(): Promise<void> {
     if (
       !vesselPending &&
       now - lastVesselAt > 600 &&
-      document.getElementById('tune')?.dataset.open === 'true'
+      (document.getElementById('tune')?.dataset.open === 'true' ||
+        tracked.vessels.length > 0)
     ) {
       vesselPending = true;
       lastVesselAt = now;
       void vesselProbe.buffer
         .read()
         .then((cells) => {
+          probeCells = cells;
           const pitch = (gravityPitch * Math.PI) / 180;
           const roll = (gravityRoll * Math.PI) / 180;
           drawVessels(
@@ -1528,6 +1539,50 @@ async function main(): Promise<void> {
    * of them running at once - and the auto-aim spawn clamp lands each drop ON
    * the face, so it rolls down the real geometry.
    */
+  /** Cups flow to the renderer and the carver whatever scene is up. */
+  function driveCups(): void {
+    // Detected cups reach the renderer, and the auto-aim spawn does the rest:
+    // pour over a held glass and the water spawns just in front of it. The
+    // collision carve that gives the glass a real interior lands once the
+    // boundary work in flight settles; until then the visual transparency and
+    // the spawn aim are already live.
+    const cupBoxes: [number, number, number, number][] = [];
+    for (const vessel of tracked.vessels.slice(0, 3)) {
+      cupBoxes.push([vessel.x0, vessel.y0, vessel.x1, vessel.y1]);
+    }
+    while (cupBoxes.length < 3) {
+      cupBoxes.push([0, 0, 0, 0]);
+    }
+    renderer.look({ cups: cupBoxes });
+
+    // The carve needs each vessel's front depth; the probe's downsample is the
+    // cheapest honest source. Nearest of five samples biases toward the glass
+    // itself over background leaking through the box corners.
+    carver.set(
+      tracked.vessels.slice(0, 3).map((vessel) => {
+        let front = 0.5;
+        if (probeCells) {
+          const cx = (vessel.x0 + vessel.x1) / 2;
+          const cy = (vessel.y0 + vessel.y1) / 2;
+          const at = (x: number, y: number) => {
+            const i = Math.min(Math.max(Math.round(x * 64), 0), 63);
+            const j = Math.min(Math.max(Math.round(y * 64), 0), 63);
+            return probeCells?.[j * 64 + i] ?? 0;
+          };
+          front = Math.max(
+            at(cx, cy),
+            at(cx - 0.05, cy),
+            at(cx + 0.05, cy),
+            at(cx, cy - 0.05),
+            at(cx, cy + 0.05),
+          );
+        }
+        return { box: [vessel.x0, vessel.y0, vessel.x1, vessel.y1] as const, front };
+      }),
+    );
+
+  }
+
   function driveTracking(now: number): void {
     if (sceneId !== 'camera' && sceneId !== 'clip') {
       if (fingerPour) {
@@ -1577,20 +1632,6 @@ async function main(): Promise<void> {
       fingerPour = pinched;
       applyFlow();
     }
-
-    // Detected cups reach the renderer, and the auto-aim spawn does the rest:
-    // pour over a held glass and the water spawns just in front of it. The
-    // collision carve that gives the glass a real interior lands once the
-    // boundary work in flight settles; until then the visual transparency and
-    // the spawn aim are already live.
-    const cupBoxes: [number, number, number, number][] = [];
-    for (const vessel of tracked.vessels.slice(0, 3)) {
-      cupBoxes.push([vessel.x0, vessel.y0, vessel.x1, vessel.y1]);
-    }
-    while (cupBoxes.length < 3) {
-      cupBoxes.push([0, 0, 0, 0]);
-    }
-    renderer.look({ cups: cupBoxes });
 
     // Light-up glasses ride the irises, colour wheeling on its own.
     if (glassesGlow > 0 && tracked.lenses.length === 2) {
@@ -1669,6 +1710,12 @@ async function main(): Promise<void> {
     Object.assign(globalThis, {
       probe: () => fluid.particles.read(),
       tracked: () => tracked,
+      fakeVessel: (x0: number, y0: number, x1: number, y1: number) => {
+        tracked = {
+          ...tracked,
+          vessels: [{ x0, y0, x1, y1, label: 'cup' }],
+        };
+      },
       look: (next: Parameters<typeof renderer.look>[0]) => renderer.look(next),
       gravityDir: () => field.scene.read(),
       storm: () => ({ flash, gust }),
