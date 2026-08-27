@@ -42,7 +42,6 @@ export interface HudConfig {
   readonly scenarios: readonly Scenario[];
   readonly rotation: ModelChoice;
   readonly mirror: ModelChoice;
-  readonly scenes: readonly SegmentOption[];
   readonly views: readonly SegmentOption[];
   /** Water or smoke. The spout carries one at a time. */
   readonly media: readonly SegmentOption[];
@@ -51,7 +50,6 @@ export interface HudConfig {
 }
 
 export interface HudActions {
-  readonly onScene: (id: string) => void;
   readonly onView: (index: number) => void;
   readonly onModel: (id: string) => void;
   readonly onPour: (on: boolean) => void;
@@ -71,7 +69,6 @@ export interface Hud {
   setSpout(x: number, y: number, depth: number, live: boolean): void;
   /** 0..1 of the water supply currently in the scene. */
   setFill(fraction: number): void;
-  setScene(id: string): void;
   setScenario(id: string): void;
   setPouring(on: boolean): void;
   /** Move a slider to a value the app worked out for itself. */
@@ -148,10 +145,6 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
   const stormButton = requireElement('storm');
   const spout = requireElement('spout');
   const drawer = requireElement('tune');
-
-  const selectScene = buildSegments(requireElement('scenes'), config.scenes, (id) =>
-    actions.onScene(id),
-  );
 
   // Named setups, so the interesting states are one click rather than a hotkey
   // and four sliders.
@@ -363,12 +356,6 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
       return;
     }
     const pressed = event.key.toLowerCase();
-    const scene = config.scenes.find((candidate) => candidate.key.toLowerCase() === pressed);
-    if (scene) {
-      selectScene(scene.id);
-      actions.onScene(scene.id);
-      return;
-    }
     if (pressed === 'o') {
       actions.onOpen();
     } else if (pressed === 's') {
@@ -405,7 +392,6 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
       spout.style.setProperty('--ring', `${(14 + depth * 30).toFixed(1)}px`);
       spout.dataset.live = String(live);
     },
-    setScene: selectScene,
     setScenario: selectScenario,
     setPouring,
 

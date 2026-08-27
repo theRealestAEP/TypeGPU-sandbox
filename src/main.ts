@@ -578,7 +578,6 @@ async function main(): Promise<void> {
   const hud = createHud(
     {
       scenarios: SCENARIOS.map(({ id, label, note }) => ({ id, label, note })),
-      scenes: SCENES,
       views: VIEWS,
       media: MEDIA,
       model: { label: 'size', options: MODEL_SIZES, value: RECOMMENDED_MODEL },
@@ -591,15 +590,6 @@ async function main(): Promise<void> {
       groups: TUNE_GROUPS,
     },
     {
-      onScene: (id) => {
-        const match = SCENES.find((candidate) => candidate.id === id);
-        if (match) {
-          if (match.id !== sceneId) {
-            resetScene();
-          }
-          void selectScene(match.id);
-        }
-      },
       onView: (index) => renderer.look({ debug: index }),
       onRotation: (value) => {
         // The dropdown is built from ROTATIONS, so any non-auto value is one of them.
@@ -678,7 +668,6 @@ async function main(): Promise<void> {
         clipSource = nextClip;
         if (sceneId !== scenario.scene || photoChanged || clipChanged) {
           resetScene();
-          hud.setScene(scenario.scene);
           void selectScene(scenario.scene);
         }
       },
@@ -1060,7 +1049,6 @@ async function main(): Promise<void> {
         }
         clipUrl = URL.createObjectURL(file);
         clipSource = clipUrl;
-        hud.setScene('clip');
         await selectScene('clip');
       } else {
         // The dropped still joins the cache like any other, under its own key.
@@ -1079,7 +1067,6 @@ async function main(): Promise<void> {
             }
           }
         }
-        hud.setScene('photo');
         await selectScene('photo');
       }
       hud.setStatus('info', `Depth from ${file.name}. Hold to pour, scroll for depth.`);
@@ -1246,7 +1233,6 @@ async function main(): Promise<void> {
       hud.setStatus('info', 'Live camera depth. Hold to pour, scroll for depth.');
     } catch (error) {
       sceneId = previous === next ? 'vessels' : previous;
-      hud.setScene(sceneId);
       camera.stop();
       const reason = error instanceof Error ? error.message : String(error);
       hud.setStatus('error', `Could not switch: ${reason}`);
@@ -1798,7 +1784,6 @@ async function main(): Promise<void> {
   // Open on the bathroom rather than the built vessels. selectScene is what
   // actually fetches the photo and warms the depth model; setting the id alone
   // leaves the page black.
-  hud.setScene('photo');
   void selectScene('photo');
 
   applyFlow();
