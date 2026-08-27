@@ -42,11 +42,11 @@ export interface TrackedPoint {
 
 export interface HeldVessel {
   /** Box in field coordinates. */
-  readonly x0: number;
-  readonly y0: number;
-  readonly x1: number;
-  readonly y1: number;
-  readonly label: string;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  label: string;
 }
 
 export interface Tracked {
@@ -99,13 +99,18 @@ export async function createGestures(): Promise<Gestures> {
       // milliseconds at the 6Hz this needs.
       baseOptions: { modelAssetPath: DETECT_MODEL, delegate: 'CPU' },
       runningMode: 'VIDEO',
-      scoreThreshold: 0.35,
+      // Low on purpose: a glass held close to the camera scores in the 0.2
+      // band, and the persistence rule below is what keeps the noise out -
+      // a detection only becomes a vessel after three consecutive rounds.
+      scoreThreshold: 0.2,
       maxResults: 4,
     }),
   ]);
 
   let lastVideoTime = -1;
   let lastDetectAt = -1e9;
+  /** Candidates carry how long they have persisted and how long been missing. */
+  let candidates: (HeldVessel & { streak: number; misses: number })[] = [];
   let heldVessels: HeldVessel[] = [];
   let held: Tracked = { vessels: [], brow: [], eyes: [], lenses: [], effort: 0 };
 
@@ -182,25 +187,45 @@ export async function createGestures(): Promise<Gestures> {
             label: category.categoryName,
           });
         }
-        // Smooth against the previous set: a box that roughly overlaps its
-        // predecessor eases toward the new detection instead of snapping.
-        heldVessels = fresh.map((next) => {
-          const prior = heldVessels.find(
-            (old) =>
-              Math.abs(old.x0 - next.x0) < 0.15 && Math.abs(old.y0 - next.y0) < 0.15,
+        // Persistence over confidence. The threshold above is low enough to
+        // let genuine close-up glasses through, so single-round noise gets in
+        // too; requiring three consecutive rounds keeps phantom cups from
+        // carving cavities into the scene. The other direction gets grace as
+        // well - a vessel survives two missed rounds - because every
+        // appear/disappear flap re-digs the carve, and that quake throws the
+        // water it held. Matched boxes ease toward the new detection.
+        const matched = new Set<number>();
+        for (const candidate of candidates) {
+          const index = fresh.findIndex(
+            (next, i) =>
+              !matched.has(i) &&
+              Math.abs(candidate.x0 - next.x0) < 0.15 &&
+              Math.abs(candidate.y0 - next.y0) < 0.15,
           );
-          if (!prior) {
-            return next;
+          if (index >= 0) {
+            matched.add(index);
+            const next = fresh[index];
+            const ease = 0.55;
+            candidate.x0 += (next.x0 - candidate.x0) * ease;
+            candidate.y0 += (next.y0 - candidate.y0) * ease;
+            candidate.x1 += (next.x1 - candidate.x1) * ease;
+            candidate.y1 += (next.y1 - candidate.y1) * ease;
+            candidate.label = next.label;
+            candidate.streak += 1;
+            candidate.misses = 0;
+          } else {
+            candidate.misses += 1;
           }
-          const ease = 0.55;
-          return {
-            x0: prior.x0 + (next.x0 - prior.x0) * ease,
-            y0: prior.y0 + (next.y0 - prior.y0) * ease,
-            x1: prior.x1 + (next.x1 - prior.x1) * ease,
-            y1: prior.y1 + (next.y1 - prior.y1) * ease,
-            label: next.label,
-          };
+        }
+        candidates = candidates.filter((candidate) => candidate.misses <= 2);
+        fresh.forEach((next, i) => {
+          if (!matched.has(i)) {
+            candidates.push({ ...next, streak: 1, misses: 0 });
+          }
         });
+        heldVessels = candidates
+          .filter((candidate) => candidate.streak >= 3)
+          .map(({ x0, y0, x1, y1, label }) => ({ x0, y0, x1, y1, label }));
       }
 
       const map = (p: { x: number; y: number }) => toField(p, fit, w, h);
