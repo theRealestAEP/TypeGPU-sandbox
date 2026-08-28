@@ -1590,10 +1590,37 @@ async function main(): Promise<void> {
       // The detector reliably cuts off the top of a clear glass - a
       // transparent rim against a pale wall has almost no features - and an
       // uncarved rim is a solid lid: pours splashed off it and ran down the
-      // outside. Extending the box upward is safe because the carve only
-      // touches texels near the vessel's own front depth; above the real rim
-      // the scene reads as background and refuses it.
-      const y0 = Math.max(vessel.y0 - (vessel.y1 - vessel.y0) * 0.3, 0);
+      // outside. But a fixed extension overshoots when the detector was
+      // right, and then the mouth logic waits for water in the middle of the
+      // wall. So the box grows upward only while the probe still reads glass
+      // there: the vessel's own front, or the cavity our carve already dug.
+      let y0 = vessel.y0;
+      if (probeCells) {
+        const h = vessel.y1 - vessel.y0;
+        const carve = Math.max((vessel.x1 - vessel.x0) * 0.9, 0.18);
+        const cols = [0.35, 0.5, 0.65].map((t) =>
+          Math.min(Math.max(Math.round((vessel.x0 + (vessel.x1 - vessel.x0) * t) * 64), 0), 63),
+        );
+        let j = Math.min(Math.max(Math.round(vessel.y0 * 64), 0), 63);
+        const jMin = Math.max(Math.round((vessel.y0 - h * 0.35) * 64), 0);
+        while (j - 1 >= jMin) {
+          const row = cols
+            .map((i) => probeCells?.[(j - 1) * 64 + i] ?? 0)
+            .sort((a, b) => a - b);
+          // The carved acceptance must be tight: the cavity floor sits at
+          // front - carve exactly, while background walls land anywhere. At
+          // 0.14 the tolerance matched a door 0.14 away and the extension
+          // climbed it to the frame top, capturing pours in mid-air.
+          const glassy =
+            Math.abs(row[1] - front) < 0.14 ||
+            Math.abs(row[1] - (front - carve)) < 0.1;
+          if (!glassy) {
+            break;
+          }
+          j -= 1;
+        }
+        y0 = j / 64;
+      }
       return { box: [vessel.x0, y0, vessel.x1, vessel.y1] as const, front };
     });
     carver.set(cups);
@@ -1601,9 +1628,23 @@ async function main(): Promise<void> {
     fluid.tune({ cups });
     latestCups = cups;
     // The outline is a diagnostic; it lives with the controls, like the
-    // gravity arrow.
+    // gravity arrow. The pour channels ride along: the render must know where
+    // a falling stream outranks the depth model's halo.
     renderer.look({
       cupLines: document.getElementById('tune')?.dataset.open === 'true' ? 1 : 0,
+      cupMouths: [0, 1, 2].map((i): [number, number, number, number] => {
+        const cup = cups[i];
+        if (!cup) {
+          return [0, 0, 0, 0];
+        }
+        const w = cup.box[2] - cup.box[0];
+        return [
+          cup.box[0] + w * 0.14,
+          cup.box[2] - w * 0.14,
+          cup.box[1] + (cup.box[3] - cup.box[1]) * 0.25,
+          1,
+        ];
+      }),
     });
 
   }
@@ -1781,6 +1822,7 @@ async function main(): Promise<void> {
       cupState: () => latestCups,
       probeCells: () => probeCells,
       gestureState: () => (gestures ? 'loaded' : gesturesLoading ? 'loading' : 'none'),
+      tuneFluid: (next: Parameters<typeof fluid.tune>[0]) => fluid.tune(next),
       pump: (count: number) => {
         for (let index = 0; index < count; index++) {
           step(previousTime + SOLVER_STEP * 1000);

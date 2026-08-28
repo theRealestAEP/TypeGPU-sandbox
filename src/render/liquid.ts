@@ -67,11 +67,23 @@ const quadCorners = tgpu.const(d.arrayOf(d.vec2f, VERTS_PER_SPLAT), [
   d.vec2f(1, 1),
 ]);
 
-const SplatParams = d.struct({ radius: d.f32 });
+const SplatParams = d.struct({
+  radius: d.f32,
+  /**
+   * Pour channels: per cup, the interior x-span and the mouth's lower edge
+   * (xLeft, xRight, yEnd, active). Water falling toward a glass is between
+   * the camera and the scene in reality, so inside these regions the
+   * occlusion discard stands down - the depth model's halo around a
+   * close-held glass was swallowing the whole stream.
+   */
+  mouths: d.arrayOf(d.vec4f, 3),
+});
 
 const LookParams = d.struct({
   /** Non-zero draws the detected-vessel outlines; tied to the tune drawer. */
   cupLines: d.f32,
+  /** Pour channels, mirrored from the splat params: xL, xR, yEnd, active. */
+  cupMouths: d.arrayOf(d.vec4f, 3),
   tint: d.vec3f,
   surfaceLow: d.f32,
   surfaceHigh: d.f32,
@@ -251,6 +263,18 @@ const splatOccluderAt = (uv: d.v2f) => {
   );
 };
 
+const inPourChannel = (uv: d.v2f) => {
+  'use gpu';
+  let inside = false;
+  for (const slot of std.range(3)) {
+    const mouth = splatLayout.$.splat.mouths[slot];
+    if (mouth.w > 0.5 && uv.x > mouth.x && uv.x < mouth.y && uv.y < mouth.z) {
+      inside = true;
+    }
+  }
+  return inside;
+};
+
 /**
  * Nearest-surface pass. Each particle is a sphere; the depth test keeps whichever
  * is closest to the camera, and the colour target carries that depth alongside a
@@ -262,8 +286,9 @@ const splatDepthFragment = tgpu.fragmentFn({
 })(({ offset, centre, spot }) => {
   'use gpu';
   const occluder = splatOccluderAt(spot);
+  const hiddenHere = centre < occluder - d.f32(KERNEL_RADIUS) * 2 && !inPourChannel(spot);
   const radial = std.dot(offset, offset);
-  if (radial > 1 || centre < occluder - d.f32(KERNEL_RADIUS) * 2) {
+  if (radial > 1 || hiddenHere) {
     std.discard();
   }
   const bulge = std.sqrt(std.max(1 - radial, 0)) * splatLayout.$.splat.radius;
@@ -281,8 +306,9 @@ const splatThicknessFragment = tgpu.fragmentFn({
 })(({ offset, centre, spot }) => {
   'use gpu';
   const occluder = splatOccluderAt(spot);
+  const hiddenHere = centre < occluder - d.f32(KERNEL_RADIUS) * 2 && !inPourChannel(spot);
   const radial = std.dot(offset, offset);
-  if (radial > 1 || centre < occluder - d.f32(KERNEL_RADIUS) * 2) {
+  if (radial > 1 || hiddenHere) {
     std.discard();
   }
   const falloff = 1 - radial;
@@ -487,6 +513,12 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
       uv.x > cup.x && uv.x < cup.z && uv.y > cup.y && uv.y < cup.w
     ) {
       hidden *= 0.15;
+    }
+    // And in the pour channel above it: the stream between camera and glass
+    // is in front of everything in reality, whatever the depth halo says.
+    const mouth = look.cupMouths[slot];
+    if (mouth.w > 0.5 && uv.x > mouth.x && uv.x < mouth.y && uv.y < mouth.z) {
+      hidden *= 0.05;
     }
   }
 
@@ -858,6 +890,8 @@ export interface LiquidLook {
   cups: readonly (readonly [number, number, number, number])[];
   /** Non-zero draws the detected-vessel outlines; tied to the tune drawer. */
   cupLines: number;
+  /** Pour channels above cup mouths: xLeft, xRight, yEnd, active. */
+  cupMouths: readonly (readonly [number, number, number, number])[];
   /** Planted lamps: xyz position + power, then rgb tint + size. */
   lightsA: readonly (readonly [number, number, number, number])[];
   lightsB: readonly (readonly [number, number, number, number])[];
@@ -892,6 +926,7 @@ export const defaultLook: LiquidLook = {
   glassesB: [1, 1, 1, 0],
   cups: Array.from({ length: 3 }, () => [0, 0, 0, 0] as const),
   cupLines: 0,
+  cupMouths: Array.from({ length: 3 }, () => [0, 0, 0, 0] as const),
   lightsA: Array.from({ length: 8 }, () => [0, 0, 0, 0] as const),
   lightsB: Array.from({ length: 8 }, () => [0, 0, 0, 0.1] as const),
   spout: [0.5, 0.1, Z_MAX * 0.92, 0.5],
@@ -946,7 +981,12 @@ export interface LiquidRenderer {
 export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): LiquidRenderer {
   let look: LiquidLook = { ...defaultLook };
 
-  const splatParams = root.createBuffer(SplatParams, { radius: look.splatRadius }).$usage('uniform');
+  const splatParams = root
+    .createBuffer(SplatParams, {
+      radius: look.splatRadius,
+      mouths: [0, 1, 2].map((): [number, number, number, number] => [0, 0, 0, 0]),
+    })
+    .$usage('uniform');
   const lookParams = root.createBuffer(LookParams).$usage('uniform');
   const cameraParams = root.createBuffer(CameraParams).$usage('uniform');
 
@@ -1084,7 +1124,13 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
   }
 
   function writeLook(): void {
-    splatParams.write({ radius: look.splatRadius });
+    splatParams.write({
+      radius: look.splatRadius,
+      mouths: [0, 1, 2].map((i): [number, number, number, number] => {
+        const mouth = look.cupMouths[i];
+        return mouth ? [mouth[0], mouth[1], mouth[2], mouth[3]] : [0, 0, 0, 0];
+      }),
+    });
     lookParams.write({
       tint: look.tint,
       surfaceLow: look.surfaceLow,
@@ -1104,6 +1150,7 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
       glassesB: four(look.glassesB),
       cups: look.cups.map(four),
       cupLines: look.cupLines,
+      cupMouths: look.cupMouths.map(four),
       lens: look.lens,
       reflection: look.reflection,
       caustics: look.caustics,

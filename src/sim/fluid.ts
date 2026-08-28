@@ -148,6 +148,7 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
   // image through a cup's mouth band is pulled onto the cavity plane, the
   // way a real opening swallows a stream. The move is a relocation, not a
   // kick: it goes through `boundary`, so finalize strips it from velocity.
+  let channel = false;
   for (const slot of std.range(3)) {
     const cup = params.cups[slot];
     if (cup.z <= cup.x) {
@@ -157,17 +158,28 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
     const inSpan =
       position.x > cup.x + cupWidth * d.f32(WALL) &&
       position.x < cup.z - cupWidth * d.f32(WALL);
+    // The pour channel: everything in a cup's column above or at its mouth
+    // falls free of the scene. A close-held glass stands against a blank
+    // wall, and a blank wall's depth is a hallucinated ledge - the stream
+    // landed on it and mushroomed in mid-air, metres above the cup it was
+    // aimed at. Inside the channel the scene does not exist; the mouth
+    // capture below is what catches the water.
+    if (inSpan && position.y < cup.y + (cup.w - cup.y) * 0.25) {
+      channel = true;
+    }
     if (
       inSpan &&
       position.y > from.y &&
       position.y > cup.y &&
       position.y < cup.y + (cup.w - cup.y) * 0.25 &&
-      // Only where the mouth truly is: the box is extended upward past the
-      // detection to cover the rim the detector cuts off, and on a close-held
-      // glass that band reaches the wall above. Capturing there hung the
-      // stream on an invisible plane in mid-air; a texel the carve refused is
-      // not a mouth.
-      surfaceAt(resolved.xy) < (params.cupFronts[slot] - 0.08) * params.depthScale
+      // Only where the mouth truly is: the texel must read as the cavity the
+      // carve dug - front minus carve, tightly. A merely-deep texel is the
+      // wall behind the glass, and capturing over it hung the stream on an
+      // invisible plane in mid-air.
+      std.abs(
+        surfaceAt(resolved.xy) -
+          (params.cupFronts[slot] - params.cupCarves[slot]) * params.depthScale,
+      ) < 0.12 * params.depthScale
     ) {
       const plane =
         (params.cupFronts[slot] - params.cupCarves[slot]) * params.depthScale +
@@ -210,6 +222,14 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
   // down on the far side, one step per contact, and the pool leaks its whole
   // contents over the brim. A particle already inside something is left alone -
   // it is being pressed in by a pour or a paw, not walking through.
+  if (channel) {
+    return d.vec3f(
+      std.clamp(resolved.x, EDGE_MARGIN, 1 - EDGE_MARGIN),
+      std.max(resolved.y, EDGE_MARGIN),
+      std.clamp(resolved.z, EDGE_MARGIN, Z_MAX - EDGE_MARGIN),
+    );
+  }
+
   // Water ENTERING a cup's mouth is exempt from the wall rule. The rim texels
   // read as a barrier, and the weir's crest-landing put a stream arriving
   // along the cavity plane ON TOP of the rim - one hop flipped a whole pour
@@ -481,8 +501,28 @@ const predictKernel = tgpu.computeFn({
     // gets rained on, a hand held over the spout catches the stream. Scrolling
     // the spout deeper still works - the clamp only stops spawning nearer than
     // the scene, never deeper into it.
+    // Except over a cup's pour channel. There the scene under the cursor is
+    // whatever depth the model hallucinated for the wall around the glass,
+    // and snapping the stream onto it started every drop buried in the halo.
+    // Channel water spawns at its raw near-camera depth, falls in clear air
+    // in front of everything, and the mouth capture takes it from there.
+    let overCup = false;
+    for (const slot of std.range(3)) {
+      const cup = params.cups[slot];
+      if (cup.z <= cup.x) {
+        continue;
+      }
+      const cupWidth = cup.z - cup.x;
+      if (
+        position.x > cup.x + cupWidth * d.f32(WALL) &&
+        position.x < cup.z - cupWidth * d.f32(WALL) &&
+        position.y < cup.y + (cup.w - cup.y) * 0.25
+      ) {
+        overCup = true;
+      }
+    }
     const under = surfaceAt(position.xy) + params.kernelRadius * 4;
-    if (position.z > under) {
+    if (!overCup && position.z > under) {
       position = d.vec3f(position.xy, under);
     }
 
@@ -712,6 +752,7 @@ const finalizeKernel = tgpu.computeFn({
   // speed across the whole interior is the rim shattering the stream and the
   // vessel confining the churn: pools form at any inflow, and standing water
   // in a glass reads as still, which it should.
+  let channel = false;
   for (const slot of std.range(3)) {
     const cup = params.cups[slot];
     if (cup.z <= cup.x) {
@@ -720,17 +761,39 @@ const finalizeKernel = tgpu.computeFn({
     const cupWidth = cup.z - cup.x;
     const cupHeight = cup.w - cup.y;
     const cupWall = params.cupFronts[slot] * params.depthScale - params.kernelRadius * 0.5;
-    if (
+    const inSpan =
       position.x > cup.x + cupWidth * d.f32(WALL) &&
-      position.x < cup.z - cupWidth * d.f32(WALL) &&
+      position.x < cup.z - cupWidth * d.f32(WALL);
+    // The pour channel again: the same span resolveSurface exempts from the
+    // scene must be exempt from the contact clamp here, or the falling
+    // stream still decelerates against the hallucinated ledge and mushrooms.
+    if (inSpan && position.y < cup.y + cupHeight * 0.25) {
+      channel = true;
+    }
+    if (
+      inSpan &&
       position.y > cup.y &&
       position.y < cup.w - cupHeight * d.f32(BASE) &&
       position.z < cupWall
     ) {
-      const rush = std.length(velocity);
-      if (rush > 0.35) {
-        velocity = velocity * (0.35 / rush);
+      // Directional on purpose. A scalar cap clogged the pour: the stream
+      // fell in faster than the cap let it leave, the column jammed back up
+      // to the spout, and spawn pressure blasted a radial firework there.
+      // Falling WITH gravity stays free - the base line catches the overrun
+      // now - while sideways and upward motion, the splash directions, stay
+      // tamed.
+      const downDir = simLayout.$.scene.down;
+      const along = std.dot(velocity, downDir);
+      const sideways = velocity - downDir * along;
+      const drift = std.length(sideways);
+      let tamed = d.vec3f(velocity);
+      if (drift > 0.3) {
+        tamed = downDir * along + sideways * (0.3 / drift);
       }
+      if (along < -0.3) {
+        tamed = tamed + downDir * (-0.3 - along);
+      }
+      velocity = d.vec3f(tamed);
     }
   }
 
@@ -750,6 +813,7 @@ const finalizeKernel = tgpu.computeFn({
   const contact = particle.prev.z - surfaceAt(particle.prev.xy);
   const gap = position.z - surfaceAt(position.xy);
   if (
+    !channel &&
     std.min(contact, gap) < params.kernelRadius * 0.35 &&
     std.max(contact, gap) > -params.surfaceShell
   ) {
