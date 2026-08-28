@@ -102,11 +102,13 @@ function chooseParticles(fallback: number): number {
 }
 
 /**
- * Enough to actually fill a basin rather than puddle in one. 80,000 was 2.35% of
- * the simulation box, and a pool wants something nearer 15%. Measured at 60 fps
- * on a desktop GPU; ?particles=N overrides it either way.
+ * Enough to actually fill a basin rather than puddle in one, but capped where
+ * the solver still holds its 120Hz step rate. At 400,000 the sim ran at half
+ * speed on the reference machine - water in visible slow motion, which reads
+ * as lag - and every containment fix made it worse by keeping more particles
+ * alive. 180,000 holds rate and still fills the tub; ?particles=N overrides.
  */
-export const PARTICLE_COUNT = chooseParticles(QUALITY === 'low' ? 40000 : 400000);
+export const PARTICLE_COUNT = chooseParticles(QUALITY === 'low' ? 40000 : 180000);
 
 /** Side length of the depth field, in texels. */
 export const FIELD_RES = QUALITY === 'low' ? 192 : 256;
@@ -229,6 +231,8 @@ export const SimParams = d.struct({
   cupFronts: d.vec4f,
   /** Per cup, how deep its carved interior goes (raw 0..1); w is unused. */
   cupCarves: d.vec4f,
+  /** How many cup slots are live. Zero lets every cup loop skip outright. */
+  cupCount: d.u32,
 });
 
 export const FieldParams = d.struct({

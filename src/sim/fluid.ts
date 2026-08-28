@@ -1432,6 +1432,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
         const cup = tuning.cups[i];
         return cup ? [cup.box[0], cup.box[1], cup.box[2], cup.box[3]] : [0, 0, 0, 0];
       }),
+      cupCount: Math.min(tuning.cups.length, 3),
       cupFronts: [
         tuning.cups[0]?.front ?? 0,
         tuning.cups[1]?.front ?? 0,

@@ -42,7 +42,10 @@ const SOLVER_STEP = 1 / 120;
  * again. Under load the simulation now runs slower than the wall clock rather
  * than the whole page stuttering, which is the better of the two.
  */
-const MAX_STEPS_PER_FRAME = 2;
+// Three, not two: at 50-70fps a two-step budget cannot reach the 120Hz the
+// solver is tuned for, and the accumulator clip below discards the shortfall
+// as lost time - the water ran in chronic slow motion and read as lag.
+const MAX_STEPS_PER_FRAME = 3;
 const MAX_CANVAS_SIDE = 1024;
 const HINT_MS = 7000;
 
@@ -1306,7 +1309,9 @@ async function main(): Promise<void> {
       steps++;
     }
     // Drop the debt rather than owing it to the next frame.
-    accumulator = Math.min(accumulator, SOLVER_STEP);
+    // Keep up to two steps of debt so one long frame borrows rather than
+    // burns; only sustained overload sheds time.
+    accumulator = Math.min(accumulator, SOLVER_STEP * 2);
     if (steps > 0) {
       const simPass = encoder.beginComputePass();
       // Walk the collision surface to where it stands at this instant. Depth
