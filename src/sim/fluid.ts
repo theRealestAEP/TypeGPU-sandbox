@@ -232,7 +232,18 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
       // the box is escaped pool, and the floor takes it back.
       resolved.y < cup.w + 0.06
     ) {
-      resolved = d.vec3f(resolved.x, baseLine - params.kernelRadius * 0.5, resolved.z);
+      // A cup clamp is contact up to one kernel radius and a relocation
+      // past it. Fully unrecorded, long-range snaps read back as velocity -
+      // the sealed pool sprayed streak ejecta over the rim. Fully recorded,
+      // the wall killed nothing - outward momentum survived every clamp and
+      // ground the pool through the gates. So the first kernel radius of
+      // every snap stays kinetic (an honest collision) and only the excess
+      // rides through `boundary`.
+      const snapped = d.vec3f(resolved.x, baseLine - params.kernelRadius * 0.5, resolved.z);
+      const full = snapped - resolved;
+      const kick = std.clamp(full, d.vec3f(-params.kernelRadius), d.vec3f(params.kernelRadius));
+      simLayout.$.boundary[index] = simLayout.$.boundary[index] + (full - kick);
+      resolved = d.vec3f(snapped);
     }
 
     // And sides. The carved ramps were the lateral walls, but their tapered
@@ -261,11 +272,16 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
       from.x > spanL &&
       from.x < spanR
     ) {
+      let snapped = d.vec3f(resolved);
       if (resolved.x <= spanL) {
-        resolved = d.vec3f(spanL + params.kernelRadius * 0.5, resolved.yz);
+        snapped = d.vec3f(spanL + params.kernelRadius * 0.5, resolved.yz);
       } else if (resolved.x >= spanR) {
-        resolved = d.vec3f(spanR - params.kernelRadius * 0.5, resolved.yz);
+        snapped = d.vec3f(spanR - params.kernelRadius * 0.5, resolved.yz);
       }
+      const full = snapped - resolved;
+      const kick = std.clamp(full, d.vec3f(-params.kernelRadius), d.vec3f(params.kernelRadius));
+      simLayout.$.boundary[index] = simLayout.$.boundary[index] + (full - kick);
+      resolved = d.vec3f(snapped);
     }
     // Outer walls at the box edges. The span clamps guarded the interior
     // while the wall-margin strips - inside the box, outside the span - had
@@ -286,11 +302,16 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
       resolved.y > cup.y &&
       resolved.y < cup.w
     ) {
+      let snapped = d.vec3f(resolved);
       if (resolved.x <= outerL) {
-        resolved = d.vec3f(outerL + params.kernelRadius * 0.5, resolved.yz);
+        snapped = d.vec3f(outerL + params.kernelRadius * 0.5, resolved.yz);
       } else if (resolved.x >= outerR) {
-        resolved = d.vec3f(outerR - params.kernelRadius * 0.5, resolved.yz);
+        snapped = d.vec3f(outerR - params.kernelRadius * 0.5, resolved.yz);
       }
+      const full = snapped - resolved;
+      const kick = std.clamp(full, d.vec3f(-params.kernelRadius), d.vec3f(params.kernelRadius));
+      simLayout.$.boundary[index] = simLayout.$.boundary[index] + (full - kick);
+      resolved = d.vec3f(snapped);
     }
   }
 
@@ -839,8 +860,13 @@ const finalizeKernel = tgpu.computeFn({
       // Land INSIDE, not on the fence. Clamping to exactly `wall` meant the
       // next step's prev.z < wall gate failed on equality, the gate never
       // re-armed, and every clamped particle escaped on the following push -
-      // the wall was a turnstile that counted each one once.
-      position = d.vec3f(position.xy, wall - params.kernelRadius);
+      // the wall was a turnstile that counted each one once. And through
+      // `boundary`, so the relocation is not a kick.
+      const held = d.vec3f(position.xy, wall - params.kernelRadius);
+      const full = held - position;
+      const kick = std.clamp(full, d.vec3f(-params.kernelRadius), d.vec3f(params.kernelRadius));
+      simLayout.$.boundary[gid.x] = simLayout.$.boundary[gid.x] + (full - kick);
+      position = d.vec3f(held);
     }
   }
 

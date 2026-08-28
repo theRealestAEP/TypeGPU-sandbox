@@ -866,7 +866,8 @@ async function main(): Promise<void> {
     gravityArrow.style.setProperty('--len', `${(flat * 6).toFixed(2)}rem`);
     const lean = gravityManual ? 'pinned' : 'measured';
     gravityNote.textContent =
-      `down · ${gravityPitch.toFixed(0)}\u00b0 into scene · ${gravityRoll.toFixed(0)}\u00b0 roll · ${lean}`;
+      `down · ${gravityPitch.toFixed(0)}\u00b0 into scene · ${gravityRoll.toFixed(0)}\u00b0 roll · ${lean}` +
+      ` · ${frameMsEma.toFixed(1)}ms (peak ${frameMsPeak.toFixed(0)})`;
   }
 
   // Hand control: shown only where there is a hand to track, toggled by
@@ -1821,7 +1822,21 @@ async function main(): Promise<void> {
     }
   }
 
+  /** Frame pacing, for the lag question "is it me or the sim". EMA tracks
+   * the typical frame, the decaying peak keeps the worst recent hitch
+   * visible for a few seconds. Shown with the gravity probe while the
+   * drawer is open; globalThis.perf() in dev. */
+  let frameMsEma = 16.7;
+  let frameMsPeak = 16.7;
+  let lastFrameAt = 0;
+
   function frame(now: number): void {
+    if (lastFrameAt > 0) {
+      const ms = now - lastFrameAt;
+      frameMsEma += (ms - frameMsEma) * 0.05;
+      frameMsPeak = Math.max(frameMsPeak * 0.995, ms);
+    }
+    lastFrameAt = now;
     try {
       step(now);
     } catch (error) {
@@ -1852,6 +1867,7 @@ async function main(): Promise<void> {
       smokeGrid: () => smoke.readCells(),
       counters: () => ({ solverSteps, encodes }),
       cupState: () => latestCups,
+      perf: () => ({ frameMsEma, frameMsPeak, solverSteps, encodes }),
       probeCells: () => probeCells,
       gestureState: () => (gestures ? 'loaded' : gesturesLoading ? 'loading' : 'none'),
       tuneFluid: (next: Parameters<typeof fluid.tune>[0]) => fluid.tune(next),
