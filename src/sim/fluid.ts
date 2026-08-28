@@ -31,6 +31,7 @@ import {
   spikyCoefficient,
 } from './schemas.ts';
 import { BASE, WALL } from '../depth/carve.ts';
+import { VESSEL_RES } from '../depth/vessels.ts';
 import type { ParticleBuffer } from './schemas.ts';
 
 /** Keeps particles a hair inside the side walls and the front plane. */
@@ -918,7 +919,19 @@ const viscosityKernel = tgpu.computeFn({
   // particle at the waterline flickered between calm and awake with every
   // wobble of its tilt estimate, and each waking re-armed gravity for a step -
   // the last visible simmer lived exactly there.
-  const instant = (1 - std.saturate(around / CALM_SPEED)) * support * levelness;
+  // And it must be somewhere water can actually stand. The flood's spill
+  // surface says, per column, the highest potential a pool can reach before
+  // it finds an exit; above that line "calm" is a lie - the tub's mound
+  // climbed the side walls as sleeping jello because nothing told it that
+  // height was uncontainable. Water above spill level keeps its gravity and
+  // flows away, however still its neighbourhood momentarily is.
+  const texelX = d.u32(std.clamp(position.x * d.f32(VESSEL_RES), 0, d.f32(VESSEL_RES - 1)));
+  const texelY = d.u32(std.clamp(position.y * d.f32(VESSEL_RES), 0, d.f32(VESSEL_RES - 1)));
+  const cell = texelY * d.u32(VESSEL_RES) + texelX;
+  const spillLevel = simLayout.$.spill[cell >> 2][cell & 3];
+  const standing = -std.dot(simLayout.$.scene.down, position);
+  const restable = 1 - std.saturate((standing - spillLevel) / 0.02);
+  const instant = (1 - std.saturate(around / CALM_SPEED)) * support * levelness * restable;
   const calm = std.mix(instant, simLayout.$.calms[gid.x], 0.65);
   simLayout.$.calms[gid.x] = calm;
   const coefficient = params.viscosity + calm * (CALM_VISCOSITY - params.viscosity);
@@ -1034,6 +1047,8 @@ export interface Fluid {
   initAsync(): Promise<void>;
   encode(pass: TgpuComputePass): void;
   tune(next: Partial<FluidTuning>): void;
+  /** Uploads the flood's spill-level surface; see the calm gate that reads it. */
+  setSpill(filled: Float32Array): void;
   /** Send every particle back to the dormant pool, emptying the scene. */
   drain(): void;
   destroy(): void;
@@ -1098,6 +1113,14 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
   const boundary = root.createBuffer(d.arrayOf(d.vec3f, PARTICLE_COUNT)).$usage('storage');
   const grid = createHashGrid(root, particles);
 
+  // Spill-level surface, uploaded from the CPU flood a few times a second.
+  // Starts effectively infinite: until the first flood lands, every height is
+  // "containable" and the calm system behaves exactly as before.
+  const spill = root
+    .createBuffer(d.arrayOf(d.vec4f, (VESSEL_RES * VESSEL_RES) / 4))
+    .$usage('uniform');
+  spill.write(new Float32Array(VESSEL_RES * VESSEL_RES).fill(1e6));
+
   const bindGroup = root.createBindGroup(simLayout, {
     params,
     particles,
@@ -1112,6 +1135,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
     surfaceLive: inputs.surfaceLive.createView(),
     surfaceBack: inputs.surfaceBack.createView(),
     scene: inputs.scene,
+    spill,
     fieldSampler: inputs.fieldSampler,
   });
 
@@ -1233,6 +1257,10 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
       particles.write(initialParticles(emitterPosition()));
     },
 
+    setSpill(filled) {
+      spill.write(filled);
+    },
+
     destroy() {
       grid.destroy();
       particles.destroy();
@@ -1241,6 +1269,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
       population.destroy();
       calms.destroy();
       boundary.destroy();
+      spill.destroy();
     },
   };
 }

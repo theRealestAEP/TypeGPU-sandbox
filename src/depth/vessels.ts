@@ -72,6 +72,26 @@ export function findVessels(
   down: readonly [number, number, number],
   depthScale: number,
 ): Vessel[] {
+  return floodVessels(depth, down, depthScale).vessels;
+}
+
+/**
+ * The flood's by-product is as useful as its pockets: `filled` holds, per
+ * texel, the highest gravitational potential water can stand at before it
+ * finds a path out of frame. Anything above that level is uncontainable by
+ * definition, which is exactly what the solver's calm system needs to know.
+ */
+export interface Flood {
+  readonly vessels: Vessel[];
+  /** Per texel, the highest potential water can stand at before spilling. */
+  readonly filled: Float64Array;
+}
+
+export function floodVessels(
+  depth: ArrayLike<number>,
+  down: readonly [number, number, number],
+  depthScale: number,
+): Flood {
   const n = VESSEL_RES;
   const [dx, dy, dz] = down;
   const potential = new Float64Array(n * n);
@@ -218,7 +238,7 @@ export function findVessels(
     });
   }
   vessels.sort((a, b) => b.capacity - a.capacity);
-  return vessels.slice(0, MAX_VESSELS);
+  return { vessels: vessels.slice(0, MAX_VESSELS), filled };
 }
 
 export interface VesselProbe {

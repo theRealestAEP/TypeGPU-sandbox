@@ -8,7 +8,7 @@ import type { CameraFrame, DepthSource } from './depth/depth-field.ts';
 import { createCarver } from './depth/carve.ts';
 import { createSceneLight } from './depth/lighting.ts';
 import type { Gestures, Tracked } from './track/gestures.ts';
-import { type Vessel, createVesselProbe, findVessels } from './depth/vessels.ts';
+import { type Vessel, createVesselProbe, floodVessels } from './depth/vessels.ts';
 import { createModelDepth } from './depth/model-depth.ts';
 import { MODEL_SIZES, RECOMMENDED_MODEL, type ModelSize } from './depth/model-store.ts';
 import { createSyntheticDepth } from './depth/synthetic-depth.ts';
@@ -1389,15 +1389,11 @@ async function main(): Promise<void> {
     driveTracking(now);
     driveCups();
 
-    // While the drawer is open, keep the vessel outlines fresh: every basin
-    // the scene could hold liquid in, with how deep it can fill. On video the
-    // outlines track whatever the depth model sees frame to frame.
-    if (
-      !vesselPending &&
-      now - lastVesselAt > 600 &&
-      (document.getElementById('tune')?.dataset.open === 'true' ||
-        tracked.vessels.length > 0)
-    ) {
+    // The flood runs all the time now, not only while the drawer is open: its
+    // spill surface feeds the solver's calm gate, which is how the sim knows
+    // that water piled above a basin's rim has nowhere to rest. The outline
+    // overlay still only draws with the drawer.
+    if (!vesselPending && now - lastVesselAt > 600) {
       vesselPending = true;
       lastVesselAt = now;
       void vesselProbe.buffer
@@ -1406,13 +1402,17 @@ async function main(): Promise<void> {
           probeCells = cells;
           const pitch = (gravityPitch * Math.PI) / 180;
           const roll = (gravityRoll * Math.PI) / 180;
-          drawVessels(
-            findVessels(
-              cells,
-              [Math.sin(roll) * Math.cos(pitch), Math.cos(roll) * Math.cos(pitch), -Math.sin(pitch)],
-              depthScaleNow,
-            ),
+          const flood = floodVessels(
+            cells,
+            [Math.sin(roll) * Math.cos(pitch), Math.cos(roll) * Math.cos(pitch), -Math.sin(pitch)],
+            depthScaleNow,
           );
+          fluid.setSpill(Float32Array.from(flood.filled));
+          if (document.getElementById('tune')?.dataset.open === 'true') {
+            drawVessels(flood.vessels);
+          } else {
+            drawVessels([]);
+          }
         })
         .catch(() => {
           // A read in flight when the device is torn down aborts; expected.

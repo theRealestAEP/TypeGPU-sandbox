@@ -41,6 +41,13 @@ export const simLayout = tgpu.bindGroupLayout({
    * eighth storage buffer of the eight the device guarantees per stage.
    */
   boundary: { storage: d.arrayOf(d.vec3f), access: 'mutable' },
+  /**
+   * Spill-level surface from the CPU priority flood, at the vessel probe's
+   * 64x64: per texel, the highest gravitational potential water can stand at
+   * before it finds a path out of frame. Packed four texels to a vec4 so the
+   * uniform layout has no per-element padding; 16KB total.
+   */
+  spill: { uniform: d.arrayOf(d.vec4f, 1024) },
   fieldSampler: { sampler: 'filtering' },
 });
 
