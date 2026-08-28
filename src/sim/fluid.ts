@@ -106,6 +106,19 @@ const surfacePrevAt = (image: d.v2f) => {
  * at solver rate, not video rate - clears that penetration about four times
  * faster than the obstacle created it. Every cat that moved threw the pool.
  */
+/**
+ * The slab thickness in WORLD units. surfaceShell is authored in raw scene
+ * units, and using it unscaled broke at low depth scale: at 0.14 the shell
+ * exceeded the entire world's depth, every surface was "behind" every other,
+ * and cups dissolved completely - zero retention, measured. The scene's own
+ * depth scale is part of what "thick" means, exactly as TOPOLOGY_SNAP already
+ * acknowledged.
+ */
+const shellNow = () => {
+  'use gpu';
+  return simLayout.$.params.surfaceShell * simLayout.$.params.depthScale;
+};
+
 const surfaceAt = (image: d.v2f) => {
   'use gpu';
   return (
@@ -210,6 +223,29 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
     ) {
       resolved = d.vec3f(resolved.x, baseLine - 0.001, resolved.z);
     }
+
+    // And sides. The carved ramps were the lateral walls, but their tapered
+    // perimeter always holds a band shallower than the collision shell, and
+    // the pool bled out through that ring - slowly at the default shell,
+    // totally with the slider up. A cup's containment must not depend on the
+    // shell at all: one-way clamps at the interior span's edges finish the
+    // box. Mouth, base, front, sides - each judged on where the water came
+    // from, so outside water is never trapped in.
+    const spanL = cup.x + cupWidth * d.f32(WALL);
+    const spanR = cup.z - cupWidth * d.f32(WALL);
+    if (
+      resolved.z < cupWall &&
+      resolved.y > cup.y &&
+      resolved.y < baseLine &&
+      from.x > spanL &&
+      from.x < spanR
+    ) {
+      if (resolved.x <= spanL) {
+        resolved = d.vec3f(spanL + 0.001, resolved.yz);
+      } else if (resolved.x >= spanR) {
+        resolved = d.vec3f(spanR - 0.001, resolved.yz);
+      }
+    }
   }
 
   // Depth cliffs are walls, and this is where they get enforced. Wherever the
@@ -245,11 +281,26 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
         continue;
       }
       const width = cup.z - cup.x;
-      if (
+      const inSpanHere =
         position.x > cup.x + width * d.f32(WALL) &&
-        position.x < cup.z - width * d.f32(WALL) &&
+        position.x < cup.z - width * d.f32(WALL);
+      if (
+        inSpanHere &&
         position.y > cup.y - 0.05 &&
         position.y < cup.y + (cup.w - cup.y) * 0.25
+      ) {
+        atMouth = true;
+      }
+      // The same stand-down at the base. The weir crest-landed the pool's
+      // deep back edge onto the glass's OUTER front - teleported past the
+      // wall plane, where the box clamps no longer own it - and the cup bled
+      // from the bottom at exactly the rate the pour filled it. Inside water
+      // meeting the base is the y-clamp's job, not the weir's.
+      const wall = params.cupFronts[slot] * params.depthScale - params.kernelRadius * 0.5;
+      if (
+        inSpanHere &&
+        from.z < wall &&
+        position.y > cup.w - (cup.w - cup.y) * d.f32(BASE) - 0.05
       ) {
         atMouth = true;
       }
@@ -258,8 +309,8 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
   const wallSurf = surfaceAt(resolved.xy);
   if (
     !atMouth &&
-    resolved.z - wallSurf < -params.surfaceShell &&
-    from.z - surfaceAt(from.xy) > -params.surfaceShell
+    resolved.z - wallSurf < -shellNow() &&
+    from.z - surfaceAt(from.xy) > -shellNow()
   ) {
     // The weir rule. A flat refusal here dammed the front rim forever: crossing
     // it demands z-clearance, and with gravity nearly level in z that clearance
@@ -318,7 +369,7 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
   // started; arriving there within one step means it was pressed through, by a
   // pour's impact or a paw, and that still gets parked out front.
   const buried = -gap;
-  const behind = buried > params.surfaceShell;
+  const behind = buried > shellNow();
   // A texel a transient occluder covers reads far in front of the remembered
   // scene. The water beneath never walked into anything - the surface flipped
   // in front of it when the occluder arrived - so the occluder is visual-only
@@ -331,10 +382,10 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
   // over it belongs behind only if it was already past the slab when the step
   // started; arriving there within one step means it was pressed through, by
   // a pour's impact, and still gets parked out front.
-  const occluded = surface - surfaceBackAt(resolved.xy) > params.surfaceShell;
+  const occluded = surface - surfaceBackAt(resolved.xy) > shellNow();
   const belongsBehind =
     (occluded && from.z - surface < -params.kernelRadius * 2) ||
-    (behind && from.z - surfaceAt(from.xy) < -params.surfaceShell);
+    (behind && from.z - surfaceAt(from.xy) < -shellNow());
 
   if (surface > playZ && gap < 0 && !belongsBehind) {
     const normal = surfaceNormal(resolved.xy);
@@ -394,7 +445,7 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
     // step until it surfaced on their face. Deeper than one shell behind the
     // remembered scene is open air: the water falls freely, hidden by what
     // stands in front of it, until something at its own depth catches it.
-    if (back > playZ && backGap < 0 && backGap > -params.surfaceShell) {
+    if (back > playZ && backGap < 0 && backGap > -shellNow()) {
       resolved = d.vec3f(
         resolved.xy,
         resolved.z + std.min(-backGap, params.pushLimit),
@@ -815,7 +866,7 @@ const finalizeKernel = tgpu.computeFn({
   if (
     !channel &&
     std.min(contact, gap) < params.kernelRadius * 0.35 &&
-    std.max(contact, gap) > -params.surfaceShell
+    std.max(contact, gap) > -shellNow()
   ) {
     const normal = surfaceNormal(position.xy);
     // How fast the surface here is advancing, phantom motion already removed.
@@ -1073,8 +1124,12 @@ export interface FluidTuning {
   emitterX: number;
   emitterY: number;
   emitterZ: number;
-  /** Detected vessels: field-space box plus front depth. At most three. */
-  cups: readonly { box: readonly [number, number, number, number]; front: number }[];
+  /** Detected vessels: field-space box, front depth, interior depth. */
+  cups: readonly {
+    box: readonly [number, number, number, number];
+    front: number;
+    carve: number;
+  }[];
 }
 
 export const defaultTuning: FluidTuning = {
@@ -1228,7 +1283,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
   }
 
   function cupCarve(cup: FluidTuning['cups'][number] | undefined): number {
-    return cup ? Math.max((cup.box[2] - cup.box[0]) * 0.9, 0.18) : 0;
+    return cup ? cup.carve : 0;
   }
 
   function writeParams(): void {

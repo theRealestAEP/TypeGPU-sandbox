@@ -73,6 +73,8 @@ export interface Hud {
   setPouring(on: boolean): void;
   /** Move a slider to a value the app worked out for itself. */
   setTune(key: string, value: number): void;
+  /** Returns every slider to its default and fires onTune for each. */
+  resetTune(): void;
   /** Show only the active tool's settings groups. */
   setToolFilter(tool: string): void;
   /** Show scene-bound settings groups only on their scene. */
@@ -271,6 +273,7 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
 
   /** Sliders by key, so measured values can be shown back on the control. */
   const tuneFields = new Map<string, (value: number) => void>();
+  const tuneDefaults: { key: string; value: number }[] = [];
 
   const toolSections: { tool: string; section: HTMLElement }[] = [];
   const sceneSections: { scene: string; section: HTMLElement }[] = [];
@@ -327,6 +330,7 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
         input.value = String(value);
         show(value);
       });
+      tuneDefaults.push({ key: field.key, value: field.value });
       label.append(field.label, readout);
       wrapper.append(label, input);
       section.append(wrapper);
@@ -397,6 +401,16 @@ export function createHud(config: HudConfig, actions: HudActions): Hud {
 
     setTune(key, value) {
       tuneFields.get(key)?.(value);
+    },
+
+    resetTune() {
+      // Reset means reset: a cranked slider is invisible state, and the worst
+      // ones quietly dissolve the physics. One press returns every dial to
+      // the value the demo was tuned for.
+      for (const { key, value } of tuneDefaults) {
+        tuneFields.get(key)?.(value);
+        actions.onTune(key, value);
+      }
     },
 
     setToolFilter(tool) {

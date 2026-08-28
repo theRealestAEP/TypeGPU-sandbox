@@ -5,7 +5,7 @@ declare const __BUILD__: string;
 import { ROTATIONS, createCameraSession, detectRotation, rotationGeometry } from './camera.ts';
 import type { Rotation } from './camera.ts';
 import type { CameraFrame, DepthSource } from './depth/depth-field.ts';
-import { createCarver } from './depth/carve.ts';
+import { carveDepth, createCarver } from './depth/carve.ts';
 import { createSceneLight } from './depth/lighting.ts';
 import type { Gestures, Tracked } from './track/gestures.ts';
 import { type Vessel, createVesselProbe, floodVessels } from './depth/vessels.ts';
@@ -222,11 +222,19 @@ const TUNE_GROUPS: readonly TuneGroup[] = [
   {
     title: 'world',
     fields: [
-      { key: 'depthScale', label: 'scene depth', min: 0.1, max: MAX_DEPTH_SCALE, step: 0.01, value: defaultTuning.depthScale },
+      // Min 0.75, measured: a shallower world starves every vessel of the
+      // depth its cavity needs - retention on the benchmark glass falls
+      // from 4,911 (1.0) to 2,750 (0.8), 580 (0.7), 2 (0.14). Below the
+      // knee the slider is a self-destruct, not a control.
+      { key: 'depthScale', label: 'scene depth', min: 0.75, max: MAX_DEPTH_SCALE, step: 0.01, value: defaultTuning.depthScale },
       { key: 'gravity', label: 'gravity', min: 0, max: 5, step: 0.05, value: defaultTuning.gravity },
       { key: 'gravityPitch', label: 'down: pitch', min: -20, max: 85, step: 1, value: 0, format: (v) => v.toFixed(0) + '\u00b0' },
       { key: 'gravityRoll', label: 'down: roll', min: -45, max: 45, step: 1, value: 0, format: (v) => v.toFixed(0) + '\u00b0' },
-      { key: 'surfaceShell', label: 'object thickness', min: 0.01, max: 0.3, step: 0.005, value: defaultTuning.surfaceShell },
+      // Max 0.18, not more: past the carve's reach the shell dissolves every
+      // wall in the scene - burial can never exceed it, so the weir waves
+      // water through glass sides and tub rims alike. Measured: one particle
+      // of 26k retained at 0.3.
+      { key: 'surfaceShell', label: 'object thickness', min: 0.01, max: 0.18, step: 0.005, value: defaultTuning.surfaceShell },
       { key: 'rainReach', label: 'play depth', min: 0, max: 0.8, step: 0.01, value: defaultTuning.rainReach },
     ],
   },
@@ -671,7 +679,10 @@ async function main(): Promise<void> {
           void selectScene(scenario.scene);
         }
       },
-      onDrain: () => resetScene(),
+      onDrain: () => {
+        resetScene();
+        hud.resetTune();
+      },
       onTune: (key, value) => {
         if (key === 'sunBearing' || key === 'sunHeight') {
           // One key light. Smoke lit from somewhere else reads as a sticker.
@@ -696,6 +707,9 @@ async function main(): Promise<void> {
           showGravity();
           hud.setStatus('info', `Down is pinned at ${gravityPitch.toFixed(0)}\u00b0 pitch. Pick a scene to measure it again.`);
           return;
+        }
+        if (key === 'surfaceShell') {
+          surfaceShellNow = value;
         }
         if (key === 'depthScale') {
           depthScaleNow = value;
@@ -1534,7 +1548,12 @@ async function main(): Promise<void> {
    * the face, so it rolls down the real geometry.
    */
   /** Cups flow to the renderer and the carver whatever scene is up. */
-  let latestCups: { box: readonly [number, number, number, number]; front: number }[] = [];
+  let latestCups: {
+    box: readonly [number, number, number, number];
+    front: number;
+    carve: number;
+  }[] = [];
+  let surfaceShellNow = defaultTuning.surfaceShell;
   function driveCups(): void {
     // Detected cups reach the renderer, and the auto-aim spawn does the rest:
     // pour over a held glass and the water spawns just in front of it. The
@@ -1599,7 +1618,7 @@ async function main(): Promise<void> {
       let y0 = vessel.y0;
       if (probeCells) {
         const h = vessel.y1 - vessel.y0;
-        const carve = Math.max((vessel.x1 - vessel.x0) * 0.9, 0.18);
+        const carve = carveDepth(vessel.x1 - vessel.x0, surfaceShellNow);
         const cols = [0.35, 0.5, 0.65].map((t) =>
           Math.min(Math.max(Math.round((vessel.x0 + (vessel.x1 - vessel.x0) * t) * 64), 0), 63),
         );
@@ -1623,7 +1642,11 @@ async function main(): Promise<void> {
         }
         y0 = j / 64;
       }
-      return { box: [vessel.x0, y0, vessel.x1, vessel.y1] as const, front };
+      return {
+        box: [vessel.x0, y0, vessel.x1, vessel.y1] as const,
+        front,
+        carve: carveDepth(vessel.x1 - vessel.x0, surfaceShellNow),
+      };
     });
     carver.set(cups);
     // The solver gets the same cups, for the near-wall containment.

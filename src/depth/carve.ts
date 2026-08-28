@@ -123,6 +123,19 @@ export interface CupCarve {
   /** The vessel's box in field space plus its measured front depth (0..1). */
   readonly box: readonly [number, number, number, number];
   readonly front: number;
+  /** How deep the interior goes; use carveDepth so every consumer agrees. */
+  readonly carve: number;
+}
+
+/**
+ * Interior depth for a vessel. Width-proportional - cups are self-similar -
+ * with two floors: a cavity shallower than the collision shell cannot dam
+ * anything, and the shell is a USER SLIDER. Cranked past the old fixed carve
+ * it dissolved every glass wall: burial never exceeded the shell, so the
+ * weir waved the water straight through the sides.
+ */
+export function carveDepth(width: number, shell: number): number {
+  return Math.max(width * 0.9, 0.18, shell + 0.06);
 }
 
 export interface Carver {
@@ -167,11 +180,7 @@ export function createCarver(root: TgpuRoot, depth: SingleChannelTexture): Carve
         const cup = cups[i];
         if (cup) {
           a.push([cup.box[0], cup.box[1], cup.box[2], cup.box[3]]);
-          // Interior depth is close to rim width; cups are self-similar. The
-          // floor matters as much as the ratio: a cavity shallower than the
-          // collision shell cannot dam anything, so narrow or distant cups
-          // still get walls worth the name.
-          b.push([cup.front, Math.max((cup.box[2] - cup.box[0]) * 0.9, 0.18), 0, 0]);
+          b.push([cup.front, cup.carve, 0, 0]);
         } else {
           a.push([0, 0, 0, 0]);
           b.push([0, 0, 0, 0]);
