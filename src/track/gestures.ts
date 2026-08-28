@@ -242,7 +242,11 @@ export async function createGestures(needs: GestureNeeds): Promise<Gestures> {
           candidate.misses += 1;
         }
       }
-      candidates = candidates.filter((candidate) => candidate.misses <= 2);
+      // Eight rounds of grace, not two. At the holding cadence that is four
+      // seconds: a live detector misses in bursts, and every expiry throws
+      // away the carve - the cup's interior visibly popped out of existence
+      // and back while the glass sat still, dumping its water each time.
+      candidates = candidates.filter((candidate) => candidate.misses <= 8);
       fresh.forEach((next, i) => {
         if (!matched.has(i)) {
           candidates.push({ ...next, streak: 1, misses: 0 });

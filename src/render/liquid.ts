@@ -976,7 +976,7 @@ export interface LiquidInputs {
 export interface LiquidRenderer {
   initAsync(): Promise<void>;
   /** Splat and blur the fluid surface; call inside the frame's command encoder. */
-  encodeSurface(encoder: TgpuCommandEncoder): void;
+  encodeSurface(encoder: TgpuCommandEncoder, hasWater: boolean): void;
   /** Draw the composite to the canvas. Pass the camera frame when there is one. */
   encodeComposite(encoder: TgpuCommandEncoder, frame: CameraFrame | undefined): void;
   look(next: Partial<LiquidLook>): void;
@@ -987,6 +987,8 @@ export interface LiquidRenderer {
 
 export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): LiquidRenderer {
   let look: LiquidLook = { ...defaultLook };
+  /** Whether the water textures hold anything worth clearing. */
+  let surfaceDirty = true;
 
   const splatParams = root
     .createBuffer(SplatParams, {
@@ -1184,7 +1186,23 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
       ]);
     },
 
-    encodeSurface(encoder) {
+    encodeSurface(encoder, hasWater) {
+      // An empty scene pays nothing: no splats, no blurs, no temporal walk.
+      // Two full-particle render passes plus four compute dispatches ran
+      // every frame for water that did not exist - most of the idle cost.
+      if (!hasWater) {
+        if (surfaceDirty) {
+          fluid.clear();
+          history.clear();
+          thickness.clear();
+          thickHistory.clear();
+          rawDepth.clear();
+          rawThickness.clear();
+          surfaceDirty = false;
+        }
+        return;
+      }
+      surfaceDirty = true;
       const depthPass = encoder.beginRenderPass({
         colorAttachments: { view: rawDepthView, loadOp: 'clear', storeOp: 'store' },
         depthStencilAttachment: {

@@ -43,14 +43,15 @@ Also `npm run build`, `npm run lint`, `npm run typecheck`.
 Hold space to pour. Scroll to set the spout's depth. Drop in your own image or
 video, or hold a glass up to the camera. `T` opens the tuning panel; `D`
 resets the scene and every slider. `?particles=N` overrides the particle
-budget.
+budget. On camera scenes, `H` toggles hand control (off by default - it costs
+a GPU model per frame): your index fingertip steers the spout and a pinch
+pours.
 
 ## Picking a scene that works
 
 Liquid gathers where the scene has a closed depression under gravity. A basin
 shot from near eye level is edge-on and holds almost nothing, however deep it
-looks. Roughly 35° above the vessel or steeper is what you want - or hold up
-a cup and let the detector do the rest.
+looks.
 
 ```sh
 node tools/score-scene.mjs <image> [--region x0,x1,y0,y1]

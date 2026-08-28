@@ -574,6 +574,7 @@ async function main(): Promise<void> {
    * two thirds full over a pool with nothing in it.
    */
   let inScene = 0;
+  let lastWetAt = 0;
   /** One census readback in flight at a time. */
   let censusPending = false;
   let lastCensusAt = 0;
@@ -1315,7 +1316,15 @@ async function main(): Promise<void> {
     // Keep up to two steps of debt so one long frame borrows rather than
     // burns; only sustained overload sheds time.
     accumulator = Math.min(accumulator, SOLVER_STEP * 2);
-    if (steps > 0) {
+    // Water in flight, water settled, or water about to exist - otherwise the
+    // whole solver stack sleeps. It used to grind every dormant particle
+    // through three substeps and both splat passes for an empty scene, which
+    // was most of "10-20fps with no particles".
+    const hasWater = inScene > 0 || pouringNow() || now - lastWetAt < 1500;
+    if (hasWater) {
+      lastWetAt = pouringNow() || inScene > 0 ? now : lastWetAt;
+    }
+    if (steps > 0 && hasWater) {
       const simPass = encoder.beginComputePass();
       // Walk the collision surface to where it stands at this instant. Depth
       // lands at video rate; without this the wall jumps a whole frame of an
@@ -1476,7 +1485,7 @@ async function main(): Promise<void> {
       smokePass.end();
     }
 
-    renderer.encodeSurface(encoder);
+    renderer.encodeSurface(encoder, hasWater);
     renderer.encodeComposite(encoder, cameraFrame);
     encoder.submit();
     encodes++;
@@ -1663,6 +1672,18 @@ async function main(): Promise<void> {
           j -= 1;
         }
         y0 = j / 64;
+      }
+      // Eased against the previous frame's answer: the walk re-reads a noisy
+      // probe every frame, and each wobble of the box top moves the mouth
+      // band and re-digs the carve - at rest, the interior visibly lost and
+      // regained its depth. The prior's own top is the memory.
+      const remembered = latestCups.find(
+        (held) =>
+          Math.abs(held.box[0] - vessel.x0) < 0.15 &&
+          Math.abs(held.box[3] - vessel.y1) < 0.15,
+      );
+      if (remembered) {
+        y0 = remembered.box[1] + (y0 - remembered.box[1]) * 0.12;
       }
       return {
         box: [vessel.x0, y0, vessel.x1, vessel.y1] as const,
