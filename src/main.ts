@@ -414,6 +414,10 @@ async function main(): Promise<void> {
   /** Pinching index and thumb pours, hands-free. */
   let fingerPour = false;
   /** Water from the face itself: sliders in the face group. */
+  // Parked for now at the user's request; flip to bring sweat, tears and the
+  // party glasses back. The tracking itself stays on - cups and the fingertip
+  // cursor need it.
+  const FACE_FILTERS = false;
   let sweatRate = 0;
   let tearRate = 0;
   let faceOwned = false;
@@ -871,6 +875,9 @@ async function main(): Promise<void> {
   // "Face filters" is a doorway, not a tool: it opens the drawer where the
   // camera-scene filters live.
   const faceFilters = document.getElementById('faceFilters');
+  if (!FACE_FILTERS && faceFilters) {
+    faceFilters.hidden = true;
+  }
   faceFilters?.addEventListener('click', () => {
     const drawer = document.getElementById('tune');
     if (drawer?.dataset.open !== 'true') {
@@ -1210,7 +1217,7 @@ async function main(): Promise<void> {
       handToggle.hidden = next !== 'camera' && next !== 'clip';
     }
     if (faceFilters) {
-      faceFilters.hidden = next !== 'camera';
+      faceFilters.hidden = !FACE_FILTERS || next !== 'camera';
     }
     try {
       if (next === 'vessels') {
@@ -1757,7 +1764,7 @@ async function main(): Promise<void> {
     }
 
     // Light-up glasses ride the irises, colour wheeling on its own.
-    if (glassesGlow > 0 && tracked.lenses.length === 2) {
+    if (FACE_FILTERS && glassesGlow > 0 && tracked.lenses.length === 2) {
       const hue = (now / 25) % 360;
       const h = hue / 60;
       const x = 1 - Math.abs((h % 2) - 1);
@@ -1779,13 +1786,13 @@ async function main(): Promise<void> {
     // The face's own water. It borrows the one fluid emitter whenever the user
     // is not actively pouring, cycling it around the springs.
     const springs: { x: number; y: number; rate: number }[] = [];
-    if (sweatRate > 0) {
+    if (FACE_FILTERS && sweatRate > 0) {
       const rate = sweatRate * (0.4 + 1.6 * tracked.effort);
       for (const point of tracked.brow) {
         springs.push({ x: point.x, y: point.y, rate });
       }
     }
-    if (tearRate > 0) {
+    if (FACE_FILTERS && tearRate > 0) {
       for (const point of tracked.eyes) {
         springs.push({ x: point.x, y: point.y, rate: tearRate });
       }

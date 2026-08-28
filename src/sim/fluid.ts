@@ -243,7 +243,7 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
     if (
       resolved.z < cupWall &&
       resolved.y > cup.y &&
-      resolved.y < baseLine &&
+      resolved.y < cup.w &&
       from.x > spanL &&
       from.x < spanR
     ) {
@@ -251,6 +251,24 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
         resolved = d.vec3f(spanL + params.kernelRadius * 0.5, resolved.yz);
       } else if (resolved.x >= spanR) {
         resolved = d.vec3f(spanR - params.kernelRadius * 0.5, resolved.yz);
+      }
+    }
+    // Outer walls at the box edges. The span clamps guarded the interior
+    // while the wall-margin strips - inside the box, outside the span - had
+    // open outer edges: strip water drifted sideways out of the box at pool
+    // height and fell beside the glass. Every classified idle escapee left
+    // this way once the other boundaries sealed.
+    if (
+      resolved.z < cupWall &&
+      resolved.y > cup.y &&
+      resolved.y < cup.w &&
+      from.x > cup.x &&
+      from.x < cup.z
+    ) {
+      if (resolved.x <= cup.x) {
+        resolved = d.vec3f(cup.x + params.kernelRadius * 0.5, resolved.yz);
+      } else if (resolved.x >= cup.z) {
+        resolved = d.vec3f(cup.z - params.kernelRadius * 0.5, resolved.yz);
       }
     }
   }
@@ -784,14 +802,16 @@ const finalizeKernel = tgpu.computeFn({
     if (cup.z <= cup.x) {
       continue;
     }
-    const width = cup.z - cup.x;
-    const height = cup.w - cup.y;
     const wall = params.cupFronts[slot] * params.depthScale - params.kernelRadius * 0.5;
     if (
-      position.x > cup.x + width * d.f32(WALL) &&
-      position.x < cup.z - width * d.f32(WALL) &&
+      // The full box, like the floor - wall margins included. Strip water
+      // sat on the floor with nothing in front of it, and the base band's
+      // contact push extruded it forward past the wall plane one particle at
+      // a time: the last slow leak, 13% of the pool every ten seconds.
+      position.x > cup.x &&
+      position.x < cup.z &&
       position.y > cup.y &&
-      position.y < cup.w - height * d.f32(BASE) &&
+      position.y < cup.w &&
       position.z > wall &&
       particle.prev.z < wall
     ) {
@@ -1070,7 +1090,29 @@ const viscosityKernel = tgpu.computeFn({
   const cell = texelY * d.u32(VESSEL_RES) + texelX;
   const spillLevel = simLayout.$.spill[cell >> 2][cell & 3];
   const standing = -std.dot(simLayout.$.scene.down, position);
-  const restable = 1 - std.saturate((standing - spillLevel) / 0.02);
+  let restable = 1 - std.saturate((standing - spillLevel) / 0.02);
+  // Inside a detected cup the spill gate stands down entirely. The flood
+  // cannot see a basin at exactly level pitch - the potential's z-weight is
+  // zero, so NOTHING is containable by its arithmetic - and denying the cup
+  // pool its calm kept it churning under full gravity forever. The churn
+  // probed every boundary until something gave: the pool visibly dissolved
+  // at 13% per ten seconds with no outflow anywhere. A cup's containment is
+  // the box's promise, not the flood's.
+  for (const slot of std.range(3)) {
+    const cup = params.cups[slot];
+    if (cup.z <= cup.x) {
+      continue;
+    }
+    if (
+      position.x > cup.x &&
+      position.x < cup.z &&
+      position.y > cup.y &&
+      position.y < cup.w &&
+      position.z < params.cupFronts[slot] * params.depthScale
+    ) {
+      restable = 1;
+    }
+  }
   const instant = (1 - std.saturate(around / CALM_SPEED)) * support * levelness * restable;
   const calm = std.mix(instant, simLayout.$.calms[gid.x], 0.65);
   simLayout.$.calms[gid.x] = calm;
