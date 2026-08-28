@@ -75,12 +75,23 @@ const carveKernel = tgpu.computeFn({
       const floorRamp = 1 -
         std.smoothstep(box.w - height * 0.36, box.w - height * d.f32(BASE), uv.y);
       const bowl = carve * std.min(sideRamp, floorRamp);
-      // Only texels that belong to the vessel itself: background seen past the
-      // box's edge sits much deeper than the vessel's front and stays as it is.
-      if (std.abs(depth - front) < 0.16 && bowl > 0.001) {
-        // Clamped above the far plane: a vessel against a deep surface would
-        // otherwise carve past the back of the world and lose its floor.
-        depth = std.max(std.min(depth, front - bowl), 0.02);
+      // Two cases, one bowl. A texel near the vessel's front is the glass the
+      // model DID see: dig it down to the bowl. A texel far behind it is the
+      // glass the model saw THROUGH - a clear wall against a dark room reads
+      // as void, and a bowl with holes in its floor drains from the bottom,
+      // which is exactly what the user's depth view showed. The detector has
+      // confirmed a vessel here for three rounds; inside its interior the
+      // vessel exists whether or not the depth model can see it, so the void
+      // is raised up to the same bowl.
+      if (bowl > 0.001) {
+        const floor = std.max(front - bowl, 0.02);
+        if (std.abs(depth - front) < 0.16) {
+          // Clamped above the far plane: a vessel against a deep surface
+          // would otherwise carve past the back of the world.
+          depth = std.max(std.min(depth, floor), 0.02);
+        } else if (depth < floor) {
+          depth = floor;
+        }
       }
     }
   }

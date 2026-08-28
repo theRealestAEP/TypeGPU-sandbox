@@ -1555,11 +1555,13 @@ async function main(): Promise<void> {
     // every flicker re-digs the cavity at a new depth, and that topology quake
     // ejects whatever water had settled in it. Measured flapping between the
     // glass (0.79) and the hand holding it (1.0) when a nearest-of-five rule
-    // sampled around the box centre. So: samples at the side-wall margins,
-    // the only texels the carve never touches, so the estimate cannot chase
-    // its own output. Both walls at three heights, then a median: the hand
-    // holding the glass covers at most one wall, and the median throws its
-    // samples away. An eased hold on top, against per-frame depth noise.
+    // sampled around the box centre. And it must survive a glass the depth
+    // model cannot see at all: against a dark room the walls read as VOID,
+    // so a wall-margin median collapsed to nothing and every cup mechanism
+    // keyed off nonsense. A high percentile over a grid across the whole box
+    // finds the nearest real material - the hand holding the glass, the rim
+    // highlights, whatever the model did register - and ignores the void by
+    // construction. An eased hold on top, against per-frame depth noise.
     const cups = tracked.vessels.slice(0, 3).map((vessel) => {
       let front = 0.5;
       if (probeCells) {
@@ -1571,13 +1573,13 @@ async function main(): Promise<void> {
         const w = vessel.x1 - vessel.x0;
         const h = vessel.y1 - vessel.y0;
         const samples: number[] = [];
-        for (const tx of [0.07, 0.93]) {
-          for (const ty of [0.3, 0.5, 0.7]) {
+        for (const tx of [0.1, 0.3, 0.5, 0.7, 0.9]) {
+          for (const ty of [0.15, 0.35, 0.55, 0.75, 0.92]) {
             samples.push(at(vessel.x0 + w * tx, vessel.y0 + h * ty));
           }
         }
         samples.sort((a, b) => a - b);
-        front = samples[3];
+        front = samples[20];
       }
       const prior = latestCups.find(
         (old) =>
