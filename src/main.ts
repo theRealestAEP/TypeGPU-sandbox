@@ -410,7 +410,10 @@ async function main(): Promise<void> {
   let gesturesLoading = false;
   let tracked: Tracked = { vessels: [], brow: [], eyes: [], lenses: [], effort: 0 };
   /** Fingertip control of the active tool; the toggle beside the readouts. */
-  let handControl = true;
+  // Off by default: the hand landmarker costs GPU every frame whether or not
+  // a hand is in view, and the fingertip cursor is a novelty. The chip turns
+  // it on, which rebuilds the tracker with the model included.
+  let handControl = false;
   /** Light-up glasses: brightness slider; the colour cycles on its own. */
   let glassesGlow = 0;
   let glassesOn = false;
@@ -1533,14 +1536,20 @@ async function main(): Promise<void> {
     270: [0, -1, 1, 0],
   } satisfies Record<number, readonly [number, number, number, number]>;
 
+  let gesturesBuiltFor = '';
   function ensureGestures(): void {
-    if (gestures || gesturesLoading) {
+    const wanted = `${FACE_FILTERS}:${handControl}`;
+    if (gesturesLoading || (gestures && gesturesBuiltFor === wanted)) {
       return;
     }
+    const stale = gestures;
+    gestures = undefined;
+    stale?.destroy();
     gesturesLoading = true;
+    gesturesBuiltFor = wanted;
     void import('./track/gestures.ts')
       .then(async (mod) => {
-        gestures = await mod.createGestures();
+        gestures = await mod.createGestures({ face: FACE_FILTERS, hands: handControl });
       })
       .catch((error) => {
         const reason = error instanceof Error ? error.message : String(error);

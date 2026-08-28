@@ -24,8 +24,14 @@ const DETECT_MODEL =
 
 /** COCO classes that mean "a thing you could pour into". */
 const VESSEL_CLASSES = new Set(['cup', 'wine glass', 'bowl', 'vase']);
-/** Runs of the detector are throttled; boxes move slowly compared to hands. */
-const DETECT_EVERY_MS = 160;
+/**
+ * Detector cadence, adaptive: hunting for a vessel polls fast, holding one
+ * polls slow. Each run is a multi-millisecond synchronous WASM hit on the
+ * main thread, and at a fixed 160ms it was a metronome of jank on the live
+ * scene while the box it kept re-finding sat still.
+ */
+const DETECT_HUNT_MS = 200;
+const DETECT_HOLD_MS = 500;
 
 /** How the source frame maps into the field; mirrors the depth preprocessor. */
 export interface FrameFit {
@@ -79,21 +85,35 @@ export interface Gestures {
   destroy(): void;
 }
 
-export async function createGestures(): Promise<Gestures> {
+export interface GestureNeeds {
+  /** Run the face landmarker. Off when the face filters are parked. */
+  readonly face: boolean;
+  /** Run the hand landmarker. Off unless hand control is switched on. */
+  readonly hands: boolean;
+}
+
+export async function createGestures(needs: GestureNeeds): Promise<Gestures> {
   const files = await FilesetResolver.forVisionTasks(WASM_ROOT);
+  // Each landmarker costs real GPU time on every frame, in direct contention
+  // with the solver - the live scene ran at a third of its frame rate with
+  // two models computing results nothing consumed. Only what is needed runs.
   const [face, hands, finder] = await Promise.all([
-    FaceLandmarker.createFromOptions(files, {
-      baseOptions: { modelAssetPath: FACE_MODEL, delegate: 'GPU' },
-      runningMode: 'VIDEO',
-      numFaces: 1,
-      // oxlint-disable-next-line anti-slop/no-shape-in-symbol-names -- MediaPipe's API name
-      outputFaceBlendshapes: true,
-    }),
-    HandLandmarker.createFromOptions(files, {
-      baseOptions: { modelAssetPath: HAND_MODEL, delegate: 'GPU' },
-      runningMode: 'VIDEO',
-      numHands: 1,
-    }),
+    needs.face
+      ? FaceLandmarker.createFromOptions(files, {
+          baseOptions: { modelAssetPath: FACE_MODEL, delegate: 'GPU' },
+          runningMode: 'VIDEO',
+          numFaces: 1,
+          // oxlint-disable-next-line anti-slop/no-shape-in-symbol-names -- MediaPipe's API name
+          outputFaceBlendshapes: true,
+        })
+      : undefined,
+    needs.hands
+      ? HandLandmarker.createFromOptions(files, {
+          baseOptions: { modelAssetPath: HAND_MODEL, delegate: 'GPU' },
+          runningMode: 'VIDEO',
+          numHands: 1,
+        })
+      : undefined,
     ObjectDetector.createFromOptions(files, {
       // CPU on purpose: with three tasks sharing one context, the GPU-delegate
       // detector returned the same hallucination for every frame - it never
@@ -156,7 +176,8 @@ export async function createGestures(): Promise<Gestures> {
     fit: FrameFit,
     now: number,
   ): void {
-    if (now - lastDetectAt < DETECT_EVERY_MS) {
+    const cadence = heldVessels.length > 0 ? DETECT_HOLD_MS : DETECT_HUNT_MS;
+    if (now - lastDetectAt < cadence) {
       return;
     }
     lastDetectAt = now;
@@ -247,15 +268,15 @@ export async function createGestures(): Promise<Gestures> {
         return held;
       }
 
-      const faces = face.detectForVideo(video, now);
-      const palms = hands.detectForVideo(video, now);
+      const faces = face?.detectForVideo(video, now);
+      const palms = hands?.detectForVideo(video, now);
 
       findVessels(video, w, h, fit, now);
 
       const map = (p: { x: number; y: number }) => toField(p, fit, w, h);
       let tip: TrackedPoint | undefined;
       let thumb: TrackedPoint | undefined;
-      const palm = palms.landmarks[0];
+      const palm = palms?.landmarks[0];
       if (palm) {
         tip = map(palm[8]);
         thumb = map(palm[4]);
@@ -265,7 +286,7 @@ export async function createGestures(): Promise<Gestures> {
       const eyes: TrackedPoint[] = [];
       const lenses: TrackedPoint[] = [];
       let effort = 0;
-      const marks = faces.faceLandmarks[0];
+      const marks = faces?.faceLandmarks[0];
       if (marks) {
         for (const index of BROW_MARKS) {
           brow.push(map(marks[index]));
@@ -279,7 +300,7 @@ export async function createGestures(): Promise<Gestures> {
           lenses.push(map(marks[468]), map(marks[473]));
         }
         // oxlint-disable-next-line anti-slop/no-shape-in-symbol-names -- MediaPipe's API name
-        const blend = faces.faceBlendshapes[0];
+        const blend = faces?.faceBlendshapes[0];
         if (blend) {
           for (const category of blend.categories) {
             if (category.categoryName === 'browDownLeft' || category.categoryName === 'browDownRight') {
@@ -300,8 +321,8 @@ export async function createGestures(): Promise<Gestures> {
     },
 
     destroy() {
-      face.close();
-      hands.close();
+      face?.close();
+      hands?.close();
       finder.close();
     },
   };
