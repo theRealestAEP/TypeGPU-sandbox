@@ -1600,6 +1600,11 @@ async function main(): Promise<void> {
     // The solver gets the same cups, for the near-wall containment.
     fluid.tune({ cups });
     latestCups = cups;
+    // The outline is a diagnostic; it lives with the controls, like the
+    // gravity arrow.
+    renderer.look({
+      cupLines: document.getElementById('tune')?.dataset.open === 'true' ? 1 : 0,
+    });
 
   }
 

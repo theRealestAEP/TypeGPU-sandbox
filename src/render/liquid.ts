@@ -70,6 +70,8 @@ const quadCorners = tgpu.const(d.arrayOf(d.vec2f, VERTS_PER_SPLAT), [
 const SplatParams = d.struct({ radius: d.f32 });
 
 const LookParams = d.struct({
+  /** Non-zero draws the detected-vessel outlines; tied to the tune drawer. */
+  cupLines: d.f32,
   tint: d.vec3f,
   surfaceLow: d.f32,
   surfaceHigh: d.f32,
@@ -705,10 +707,11 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
   // test decides water-in-front from object-in-front, per texel.
 
   // A whisper of an outline on every detected vessel, so whether the detector
-  // fired is never a mystery during a live test.
+  // fired is never a mystery - but only while the tune drawer is open, the
+  // same rule as the gravity arrow: diagnostics live with the controls.
   for (const slot of std.range(3)) {
     const cup = look.cups[slot];
-    if (cup.z > cup.x) {
+    if (look.cupLines > 0.5 && cup.z > cup.x) {
       const inX = std.min(uv.x - cup.x, cup.z - uv.x);
       const inY = std.min(uv.y - cup.y, cup.w - uv.y);
       const inset = std.min(inX, inY);
@@ -853,6 +856,8 @@ export interface LiquidLook {
   glassesA: readonly [number, number, number, number];
   glassesB: readonly [number, number, number, number];
   cups: readonly (readonly [number, number, number, number])[];
+  /** Non-zero draws the detected-vessel outlines; tied to the tune drawer. */
+  cupLines: number;
   /** Planted lamps: xyz position + power, then rgb tint + size. */
   lightsA: readonly (readonly [number, number, number, number])[];
   lightsB: readonly (readonly [number, number, number, number])[];
@@ -886,6 +891,7 @@ export const defaultLook: LiquidLook = {
   glassesA: [0.4, 0.4, 0.6, 0.4],
   glassesB: [1, 1, 1, 0],
   cups: Array.from({ length: 3 }, () => [0, 0, 0, 0] as const),
+  cupLines: 0,
   lightsA: Array.from({ length: 8 }, () => [0, 0, 0, 0] as const),
   lightsB: Array.from({ length: 8 }, () => [0, 0, 0, 0.1] as const),
   spout: [0.5, 0.1, Z_MAX * 0.92, 0.5],
@@ -1097,6 +1103,7 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
       glassesA: four(look.glassesA),
       glassesB: four(look.glassesB),
       cups: look.cups.map(four),
+      cupLines: look.cupLines,
       lens: look.lens,
       reflection: look.reflection,
       caustics: look.caustics,

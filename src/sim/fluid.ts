@@ -153,12 +153,20 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
       continue;
     }
     const cupWidth = cup.z - cup.x;
-    if (
-      position.y > from.y &&
+    const inSpan =
       position.x > cup.x + cupWidth * d.f32(WALL) &&
-      position.x < cup.z - cupWidth * d.f32(WALL) &&
+      position.x < cup.z - cupWidth * d.f32(WALL);
+    if (
+      inSpan &&
+      position.y > from.y &&
       position.y > cup.y &&
-      position.y < cup.y + (cup.w - cup.y) * 0.25
+      position.y < cup.y + (cup.w - cup.y) * 0.25 &&
+      // Only where the mouth truly is: the box is extended upward past the
+      // detection to cover the rim the detector cuts off, and on a close-held
+      // glass that band reaches the wall above. Capturing there hung the
+      // stream on an invisible plane in mid-air; a texel the carve refused is
+      // not a mouth.
+      surfaceAt(resolved.xy) < (params.cupFronts[slot] - 0.08) * params.depthScale
     ) {
       const plane =
         (params.cupFronts[slot] - params.cupCarves[slot]) * params.depthScale +
@@ -172,6 +180,22 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
         simLayout.$.boundary[index] = simLayout.$.boundary[index] + (snapped - resolved);
         resolved = d.vec3f(snapped);
       }
+    }
+
+    // The glass has a bottom. The base band is uncarved, and at level pitch
+    // the weir prices a down-image exit across it at nothing, so the pool
+    // crept out under the glass - the leak was steady and visible. Water
+    // inside the cavity may not cross the base line; water running down the
+    // OUTSIDE front face is nearer than the wall plane and passes untouched.
+    const cupWall = params.cupFronts[slot] * params.depthScale - params.kernelRadius * 0.5;
+    const baseLine = cup.w - (cup.w - cup.y) * d.f32(BASE);
+    if (
+      inSpan &&
+      resolved.z < cupWall &&
+      from.y < baseLine &&
+      resolved.y >= baseLine
+    ) {
+      resolved = d.vec3f(resolved.x, baseLine - 0.001, resolved.z);
     }
   }
 
