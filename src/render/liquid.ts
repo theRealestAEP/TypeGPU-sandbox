@@ -781,7 +781,7 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
       const orbSpan = std.length(uv - orbAt);
       // Generous pre-test with the largest size an orb can reach, so the
       // texture samples below only run near a lamp at all.
-      if (orbSpan < 0.022 * 2.4) {
+      if (orbSpan < 0.022 * 3.4) {
         const b = look.lightsB[slot];
         // Explicit-level samples: this branch is per-pixel, and implicit
         // derivatives are not allowed in non-uniform control flow.
@@ -796,13 +796,20 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
         // can still give: a lamp by the camera is a bulb, one across the room a
         // distant point.
         const orbSize = d.f32(0.0045) + orbZ * 0.011;
-        const core = std.exp(-(orbSpan * orbSpan) / (orbSize * orbSize * 0.55));
-        let solidity = std.saturate(core * 2) * std.min(a.w, 1.2);
+        // A lamp is not a painted ball - it glows. The body is emissive:
+        // a hot near-white core inside a soft additive halo of the lamp's
+        // own colour, so the source reads as the brightest thing in its
+        // neighbourhood instead of a dark bead the light pretends to come
+        // from.
+        const core = std.exp(-(orbSpan * orbSpan) / (orbSize * orbSize * 0.35));
+        const halo = std.exp(-(orbSpan * orbSpan) / (orbSize * orbSize * 3.5));
+        let strength = std.min(a.w, 1.2);
         if (liveHere > orbZ + 0.05) {
-          solidity *= 0.15;
+          strength *= 0.15;
         }
-        const body = std.mix(b.xyz, d.vec3f(1), core * 0.55);
-        colour = std.mix(colour, body, std.min(solidity, 0.95));
+        colour = colour +
+          b.xyz * (halo * 0.7 * strength) +
+          std.mix(b.xyz, d.vec3f(1), 0.75) * (core * 1.25 * strength);
       }
     }
   }
