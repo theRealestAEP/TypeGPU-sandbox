@@ -227,6 +227,8 @@ export const SimParams = d.struct({
   cups: d.arrayOf(d.vec4f, 3),
   /** Per cup, the vessel's front depth (raw 0..1); w is unused. */
   cupFronts: d.vec4f,
+  /** Per cup, how deep its carved interior goes (raw 0..1); w is unused. */
+  cupCarves: d.vec4f,
 });
 
 export const FieldParams = d.struct({

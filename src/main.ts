@@ -1587,7 +1587,14 @@ async function main(): Promise<void> {
       if (prior) {
         front = prior.front + (front - prior.front) * 0.1;
       }
-      return { box: [vessel.x0, vessel.y0, vessel.x1, vessel.y1] as const, front };
+      // The detector reliably cuts off the top of a clear glass - a
+      // transparent rim against a pale wall has almost no features - and an
+      // uncarved rim is a solid lid: pours splashed off it and ran down the
+      // outside. Extending the box upward is safe because the carve only
+      // touches texels near the vessel's own front depth; above the real rim
+      // the scene reads as background and refuses it.
+      const y0 = Math.max(vessel.y0 - (vessel.y1 - vessel.y0) * 0.3, 0);
+      return { box: [vessel.x0, y0, vessel.x1, vessel.y1] as const, front };
     });
     carver.set(cups);
     // The solver gets the same cups, for the near-wall containment.

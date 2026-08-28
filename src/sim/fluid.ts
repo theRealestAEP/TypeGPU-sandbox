@@ -139,6 +139,42 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
   const params = simLayout.$.params;
   let resolved = d.vec3f(position);
 
+  // The mouth catches what falls over it. Aiming exactly at the opening is a
+  // probe's precision, not a person's: the natural spout sits a little above
+  // the glass, and from there the stream lands on the rim texels and runs
+  // down the outside - 4 particles held from a pour 12% above the mouth,
+  // against thousands from one exactly at it. So any water moving down the
+  // image through a cup's mouth band is pulled onto the cavity plane, the
+  // way a real opening swallows a stream. The move is a relocation, not a
+  // kick: it goes through `boundary`, so finalize strips it from velocity.
+  for (const slot of std.range(3)) {
+    const cup = params.cups[slot];
+    if (cup.z <= cup.x) {
+      continue;
+    }
+    const cupWidth = cup.z - cup.x;
+    if (
+      position.y > from.y &&
+      position.x > cup.x + cupWidth * d.f32(WALL) &&
+      position.x < cup.z - cupWidth * d.f32(WALL) &&
+      position.y > cup.y &&
+      position.y < cup.y + (cup.w - cup.y) * 0.25
+    ) {
+      const plane =
+        (params.cupFronts[slot] - params.cupCarves[slot]) * params.depthScale +
+        params.kernelRadius * 4;
+      // Both sides of the plane on purpose. The spout above a glass lands its
+      // stream on whatever the scene holds there - often the far wall, well
+      // BEHIND the cavity - and from there the water passed the glass and
+      // drained without ever being seen: three quarters of the pour, gone.
+      if (std.abs(resolved.z - plane) > params.kernelRadius * 2) {
+        const snapped = d.vec3f(resolved.xy, plane);
+        simLayout.$.boundary[index] = simLayout.$.boundary[index] + (snapped - resolved);
+        resolved = d.vec3f(snapped);
+      }
+    }
+  }
+
   // Depth cliffs are walls, and this is where they get enforced. Wherever the
   // scene stands a wall's height in front of where the particle came from - a
   // pool's near rim, a kerb, anything seen edge-on - crossing it in image space
@@ -149,9 +185,35 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
   // down on the far side, one step per contact, and the pool leaks its whole
   // contents over the brim. A particle already inside something is left alone -
   // it is being pressed in by a pour or a paw, not walking through.
-  const wallSurf = surfaceAt(position.xy);
+  // Water ENTERING a cup's mouth is exempt from the wall rule. The rim texels
+  // read as a barrier, and the weir's crest-landing put a stream arriving
+  // along the cavity plane ON TOP of the rim - one hop flipped a whole pour
+  // from inside the glass to running down its outside. The exemption is
+  // strictly one-way: only particles moving down the image, into the glass.
+  // Water pressed UP toward the mouth by the pool still meets the weir, which
+  // refuses the uphill crossing - that refusal is what keeps the glass shut.
+  let atMouth = false;
+  if (position.y > from.y) {
+    for (const slot of std.range(3)) {
+      const cup = params.cups[slot];
+      if (cup.z <= cup.x) {
+        continue;
+      }
+      const width = cup.z - cup.x;
+      if (
+        position.x > cup.x + width * d.f32(WALL) &&
+        position.x < cup.z - width * d.f32(WALL) &&
+        position.y > cup.y - 0.05 &&
+        position.y < cup.y + (cup.w - cup.y) * 0.25
+      ) {
+        atMouth = true;
+      }
+    }
+  }
+  const wallSurf = surfaceAt(resolved.xy);
   if (
-    position.z - wallSurf < -params.surfaceShell &&
+    !atMouth &&
+    resolved.z - wallSurf < -params.surfaceShell &&
     from.z - surfaceAt(from.xy) > -params.surfaceShell
   ) {
     // The weir rule. A flat refusal here dammed the front rim forever: crossing
@@ -398,6 +460,7 @@ const predictKernel = tgpu.computeFn({
     if (position.z > under) {
       position = d.vec3f(position.xy, under);
     }
+
   }
 
   // Down as the scene measures it. Gravity along -z alone reads as the safe
@@ -615,6 +678,35 @@ const finalizeKernel = tgpu.computeFn({
   const limit = (params.kernelRadius * 0.9) / params.dt;
   if (speed > limit) {
     velocity = velocity * (limit / speed);
+  }
+
+  // A glass is a calm place. A pour that free-falls in arrives as a
+  // firehose, shoots down the interior, overruns the floor ramp and exits
+  // over the base - at low inflow no pool ever forms, and an above-the-glass
+  // pour held 119 particles against thousands from a gentle one. Capping
+  // speed across the whole interior is the rim shattering the stream and the
+  // vessel confining the churn: pools form at any inflow, and standing water
+  // in a glass reads as still, which it should.
+  for (const slot of std.range(3)) {
+    const cup = params.cups[slot];
+    if (cup.z <= cup.x) {
+      continue;
+    }
+    const cupWidth = cup.z - cup.x;
+    const cupHeight = cup.w - cup.y;
+    const cupWall = params.cupFronts[slot] * params.depthScale - params.kernelRadius * 0.5;
+    if (
+      position.x > cup.x + cupWidth * d.f32(WALL) &&
+      position.x < cup.z - cupWidth * d.f32(WALL) &&
+      position.y > cup.y &&
+      position.y < cup.w - cupHeight * d.f32(BASE) &&
+      position.z < cupWall
+    ) {
+      const rush = std.length(velocity);
+      if (rush > 0.35) {
+        velocity = velocity * (0.35 / rush);
+      }
+    }
   }
 
   // Contact. The band has to be thin: reaching a full kernel radius in front of
@@ -1023,6 +1115,10 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
     return [tuning.emitterX, tuning.emitterY, tuning.emitterZ];
   }
 
+  function cupCarve(cup: FluidTuning['cups'][number] | undefined): number {
+    return cup ? Math.max((cup.box[2] - cup.box[0]) * 0.9, 0.18) : 0;
+  }
+
   function writeParams(): void {
     params.write({
       gravity: tuning.gravity,
@@ -1059,6 +1155,14 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
         tuning.cups[0]?.front ?? 0,
         tuning.cups[1]?.front ?? 0,
         tuning.cups[2]?.front ?? 0,
+        0,
+      ],
+      // The same self-similarity rule the carver uses; the solver needs it to
+      // know where a cup's interior plane sits.
+      cupCarves: [
+        cupCarve(tuning.cups[0]),
+        cupCarve(tuning.cups[1]),
+        cupCarve(tuning.cups[2]),
         0,
       ],
     });
