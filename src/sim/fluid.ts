@@ -215,8 +215,14 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
     // OUTSIDE front face is nearer than the wall plane and passes untouched.
     const cupWall = params.cupFronts[slot] * params.depthScale - params.kernelRadius * 0.5;
     const baseLine = cup.w - (cup.w - cup.y) * d.f32(BASE);
+    // The floor spans the WHOLE box, wall margins included. Water in the
+    // margin strips is inside the glass wall's own footprint, and letting it
+    // fall through there was the remaining bottom leak - the pool held in
+    // the middle while streams slid down just inside the box edges and out
+    // over the hand.
     if (
-      inSpan &&
+      position.x > cup.x &&
+      position.x < cup.z &&
       resolved.z < cupWall &&
       from.y < baseLine &&
       resolved.y >= baseLine
@@ -823,10 +829,12 @@ const finalizeKernel = tgpu.computeFn({
     }
     if (
       inSpan &&
-      position.y > cup.y &&
       position.y < cup.w - cupHeight * d.f32(BASE) &&
       position.z < cupWall
     ) {
+      // Applies through the pour channel too, not just below the rim: the
+      // untamed stream splashed off the mouth and a third of it ran down the
+      // OUTSIDE, which read as the glass leaking.
       // Directional on purpose. A scalar cap clogged the pour: the stream
       // fell in faster than the cap let it leave, the column jammed back up
       // to the spout, and spawn pressure blasted a radial firework there.
