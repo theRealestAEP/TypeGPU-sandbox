@@ -153,14 +153,14 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
   const params = simLayout.$.params;
   let resolved = d.vec3f(position);
 
-  // The mouth catches what falls over it. Aiming exactly at the opening is a
-  // probe's precision, not a person's: the natural spout sits a little above
-  // the glass, and from there the stream lands on the rim texels and runs
-  // down the outside - 4 particles held from a pour 12% above the mouth,
-  // against thousands from one exactly at it. So any water moving down the
-  // image through a cup's mouth band is pulled onto the cavity plane, the
-  // way a real opening swallows a stream. The move is a relocation, not a
-  // kick: it goes through `boundary`, so finalize strips it from velocity.
+  // The mouth catches what passes through it - in both directions. Falling
+  // water is the pour; RISING water is entry splash, and while the capture
+  // only took downward movers, a third of the stream ricocheted off the
+  // pool, cleared the wall plane as spray, and ran down the glass's outside
+  // - a thousand particles a second at steady state, reading as a bottom
+  // leak. Mouth-band water belongs on the cavity plane, whichever way it is
+  // going. The move is a relocation, not a kick: it goes through `boundary`,
+  // so finalize strips it from velocity.
   let channel = false;
   for (const slot of std.range(3)) {
     const cup = params.cups[slot];
@@ -182,7 +182,6 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
     }
     if (
       inSpan &&
-      position.y > from.y &&
       position.y > cup.y &&
       position.y < cup.y + (cup.w - cup.y) * 0.25 &&
       // Only where the mouth truly is: the texel must read as the cavity the
@@ -215,19 +214,21 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
     // OUTSIDE front face is nearer than the wall plane and passes untouched.
     const cupWall = params.cupFronts[slot] * params.depthScale - params.kernelRadius * 0.5;
     const baseLine = cup.w - (cup.w - cup.y) * d.f32(BASE);
-    // The floor spans the WHOLE box, wall margins included. Water in the
-    // margin strips is inside the glass wall's own footprint, and letting it
-    // fall through there was the remaining bottom leak - the pool held in
-    // the middle while streams slid down just inside the box edges and out
-    // over the hand.
+    // The floor spans the WHOLE box, wall margins included, and it is
+    // ABSOLUTE within the base band, not gated on crossing. The one-way
+    // version leaked by attrition: any particle that ever ended a step past
+    // the line - solver jitter, pool pressure - was beyond the gate forever,
+    // and at steady state a thousand particles a second percolated through a
+    // floor that held each of them "once". Interior water found anywhere in
+    // the base band goes back on the floor, every step.
     if (
       position.x > cup.x &&
       position.x < cup.z &&
       resolved.z < cupWall &&
-      from.y < baseLine &&
-      resolved.y >= baseLine
+      resolved.y >= baseLine &&
+      resolved.y < cup.w
     ) {
-      resolved = d.vec3f(resolved.x, baseLine - 0.001, resolved.z);
+      resolved = d.vec3f(resolved.x, baseLine - params.kernelRadius * 0.5, resolved.z);
     }
 
     // And sides. The carved ramps were the lateral walls, but their tapered
@@ -247,9 +248,9 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
       from.x < spanR
     ) {
       if (resolved.x <= spanL) {
-        resolved = d.vec3f(spanL + 0.001, resolved.yz);
+        resolved = d.vec3f(spanL + params.kernelRadius * 0.5, resolved.yz);
       } else if (resolved.x >= spanR) {
-        resolved = d.vec3f(spanR - 0.001, resolved.yz);
+        resolved = d.vec3f(spanR - params.kernelRadius * 0.5, resolved.yz);
       }
     }
   }
@@ -576,6 +577,18 @@ const predictKernel = tgpu.computeFn({
         position.y < cup.y + (cup.w - cup.y) * 0.25
       ) {
         overCup = true;
+        // Straight onto the cavity plane. Spawn scatter that landed on the
+        // rim-margin texels had no cavity signature for the capture to see,
+        // stayed at raw near-camera depth, and fell down the glass's front
+        // for the whole pour - the last thousand-a-second of the "leak".
+        // This is safe now for the same reason it was not before: the box's
+        // walls and floor exist geometrically, so a plane spawn cannot fall
+        // out of anything.
+        position = d.vec3f(
+          position.xy,
+          (params.cupFronts[slot] - params.cupCarves[slot]) * params.depthScale +
+            params.kernelRadius * 4,
+        );
       }
     }
     const under = surfaceAt(position.xy) + params.kernelRadius * 4;
@@ -782,7 +795,11 @@ const finalizeKernel = tgpu.computeFn({
       position.z > wall &&
       particle.prev.z < wall
     ) {
-      position = d.vec3f(position.xy, wall);
+      // Land INSIDE, not on the fence. Clamping to exactly `wall` meant the
+      // next step's prev.z < wall gate failed on equality, the gate never
+      // re-armed, and every clamped particle escaped on the following push -
+      // the wall was a turnstile that counted each one once.
+      position = d.vec3f(position.xy, wall - params.kernelRadius);
     }
   }
 
