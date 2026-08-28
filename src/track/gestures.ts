@@ -202,11 +202,18 @@ export async function createGestures(): Promise<Gestures> {
         if (index >= 0) {
           matched.add(index);
           const next = fresh[index];
-          const ease = 0.55;
-          candidate.x0 += (next.x0 - candidate.x0) * ease;
-          candidate.y0 += (next.y0 - candidate.y0) * ease;
-          candidate.x1 += (next.x1 - candidate.x1) * ease;
-          candidate.y1 += (next.y1 - candidate.y1) * ease;
+          // Asymmetric on purpose: growing edges follow the detection at
+          // full speed, shrinking edges crawl. A box that breathes sheds
+          // water - every upward jitter of the bottom edge strands the base
+          // layer outside the container for a frame, and on live footage
+          // that was a steady bottom leak. A held glass's true extent almost
+          // never shrinks quickly; jitter does.
+          const ease = (current: number, target: number, grow: boolean) =>
+            current + (target - current) * ((target > current) === grow ? 0.55 : 0.12);
+          candidate.x0 = ease(candidate.x0, next.x0, false);
+          candidate.y0 = ease(candidate.y0, next.y0, false);
+          candidate.x1 = ease(candidate.x1, next.x1, true);
+          candidate.y1 = ease(candidate.y1, next.y1, true);
           candidate.label = next.label;
           candidate.streak += 1;
           candidate.misses = 0;

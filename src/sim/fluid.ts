@@ -226,7 +226,11 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
       position.x < cup.z &&
       resolved.z < cupWall &&
       resolved.y >= baseLine &&
-      resolved.y < cup.w
+      // The catch band reaches BELOW the box: on live footage the detection
+      // jitters, and water stranded under a momentarily-shrunken bottom edge
+      // would otherwise be gone for good. Interior-depth water just below
+      // the box is escaped pool, and the floor takes it back.
+      resolved.y < cup.w + 0.06
     ) {
       resolved = d.vec3f(resolved.x, baseLine - params.kernelRadius * 0.5, resolved.z);
     }
@@ -238,8 +242,18 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
     // shell at all: one-way clamps at the interior span's edges finish the
     // box. Mouth, base, front, sides - each judged on where the water came
     // from, so outside water is never trapped in.
-    const spanL = cup.x + cupWidth * d.f32(WALL);
-    const spanR = cup.z - cupWidth * d.f32(WALL);
+    // Glasses taper. A rectangular container filled the box's bottom
+    // corners and the water bulged visibly wider than the glass at its base.
+    // Below the bowl's floor-ramp start both wall pairs lean inward, so the
+    // pool's silhouette narrows the way the vessel does.
+    const cupHeightHere = cup.w - cup.y;
+    const taperStart = cup.w - cupHeightHere * 0.36;
+    const taper = std.saturate(
+      (resolved.y - taperStart) / std.max(baseLine - taperStart, 1e-4),
+    );
+    const inset = taper * cupWidth * 0.12;
+    const spanL = cup.x + cupWidth * d.f32(WALL) + inset;
+    const spanR = cup.z - cupWidth * d.f32(WALL) - inset;
     if (
       resolved.z < cupWall &&
       resolved.y > cup.y &&
@@ -258,17 +272,24 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
     // open outer edges: strip water drifted sideways out of the box at pool
     // height and fell beside the glass. Every classified idle escapee left
     // this way once the other boundaries sealed.
+    // Absolute, not crossing-gated - the floor's lesson again. The taper
+    // moves the boundary inward with depth, and a crossing gate keyed on
+    // "was inside the current boundary" leaves anything already in the wedge
+    // unguarded; the benchmark pool collapsed 36k -> 7k through exactly that
+    // crack. Interior-depth water in the band belongs inside, full stop:
+    // beside the glass at interior depth is behind the scene and invisible,
+    // so pulling it in costs nothing visually and seals everything.
+    const outerL = cup.x + inset;
+    const outerR = cup.z - inset;
     if (
       resolved.z < cupWall &&
       resolved.y > cup.y &&
-      resolved.y < cup.w &&
-      from.x > cup.x &&
-      from.x < cup.z
+      resolved.y < cup.w
     ) {
-      if (resolved.x <= cup.x) {
-        resolved = d.vec3f(cup.x + params.kernelRadius * 0.5, resolved.yz);
-      } else if (resolved.x >= cup.z) {
-        resolved = d.vec3f(cup.z - params.kernelRadius * 0.5, resolved.yz);
+      if (resolved.x <= outerL) {
+        resolved = d.vec3f(outerL + params.kernelRadius * 0.5, resolved.yz);
+      } else if (resolved.x >= outerR) {
+        resolved = d.vec3f(outerR - params.kernelRadius * 0.5, resolved.yz);
       }
     }
   }
