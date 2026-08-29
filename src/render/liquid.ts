@@ -128,6 +128,16 @@ const LookParams = d.struct({
    */
   lightsA: d.arrayOf(d.vec4f, 8),
   lightsB: d.arrayOf(d.vec4f, 8),
+  /**
+   * Planted objects, drawn in the composite: xy image position, z depth, and
+   * the kind in w (0 empty, 1 cigarette, 2 torch, 3 campfire). Each prop also
+   * occupies one of the leading lamp slots for its glow; propCount says how
+   * many, so the orb pass leaves those slots to the drawn bodies.
+   */
+  props: d.arrayOf(d.vec4f, 4),
+  propCount: d.u32,
+  /** Seconds, for the flames and coals that animate in the shader. */
+  time: d.f32,
   /** The spout, drawn as a small lit sphere so its place in depth is legible. */
   spout: d.vec4f,
   /** Glowing glasses on a tracked face: lens centres, then colour + power. */
@@ -171,6 +181,170 @@ const lampLight = (
   const reach = std.max(std.length(toLamp), 1e-4);
   const fall = power / (1 + (reach * reach) / std.max(size * size, 1e-4));
   return tint * (fall * std.saturate(std.dot(normal, toLamp / reach)));
+};
+
+const spin = (v: d.v2f, angle: number) => {
+  'use gpu';
+  const c = std.cos(angle);
+  const s = std.sin(angle);
+  return d.vec2f(c * v.x - s * v.y, s * v.x + c * v.y);
+};
+
+/**
+ * Soft coverage of a rounded bar: p in the bar's own frame, x running from 0
+ * to len along the axis, y across. The edge is feathered about a texel so the
+ * solids below do not alias.
+ */
+const barMask = (p: d.v2f, len: number, girth: number) => {
+  'use gpu';
+  const along = std.clamp(p.x, 0, len);
+  const gap = std.length(p - d.vec2f(along, 0)) - girth;
+  return 1 - std.smoothstep(-0.0012, 0.0012, gap);
+};
+
+/**
+ * One tongue of fire, in the flame's own frame: origin at the base, x across
+ * in flame-widths, y up in flame-heights. Layered sines stand in for noise -
+ * the same trick as the lamp flicker - swaying the tongue harder the further
+ * up it goes, which is what rolls a steady cone into a live flame.
+ */
+const flameTongue = (q: d.v2f, time: number, seed: number) => {
+  'use gpu';
+  const sway = (std.sin(time * 6.3 + seed + q.y * 5.1) * 0.22 +
+    std.sin(time * 11.7 + seed * 2.7 + q.y * 9.3) * 0.11) * q.y;
+  const lick = 1 + 0.14 * std.sin(time * 9.1 + seed * 4.2);
+  const x = q.x + sway;
+  const y = q.y / lick;
+  // A teardrop: widest a third of the way up, pinched toward the tip, and
+  // nearly closed again at the base where the fuel is.
+  const girth = std.max(std.sin(std.saturate(y * 0.86 + 0.1) * Math.PI) * (1 - y * 0.35), 0.02);
+  const core = 1 - std.length(d.vec2f(x / girth, (y - 0.42) / 0.62));
+  return std.saturate(core * 1.7);
+};
+
+/** Black-body-ish ramp: red at the edges, orange body, near-white core. */
+const flameGlowColour = (heat: number) => {
+  'use gpu';
+  const body = std.mix(d.vec3f(0.85, 0.12, 0.02), d.vec3f(1, 0.55, 0.08), std.saturate(heat * 1.4));
+  return std.mix(body, d.vec3f(1, 0.93, 0.62), std.saturate(heat * heat * 1.2));
+};
+
+/**
+ * A cigarette. The coal sits at the planted point, so the standing smoke wisp
+ * rises off it; the body runs down-right at an ashtray lean - charred paper
+ * behind the coal, white paper, then the tan filter over the last third.
+ */
+const drawCigarette = (colour: d.v3f, uv: d.v2f, at: d.v3f, time: number, dim: number) => {
+  'use gpu';
+  const reach = 0.3 + at.z * 0.6;
+  const len = 0.085 * reach;
+  const girth = len * 0.052;
+  // Local frame with x running from the coal toward the filter.
+  const local = spin(uv - at.xy, -0.42);
+  const body = barMask(local, len, girth);
+  const t = std.saturate(local.x / len);
+
+  let wrap = std.mix(
+    d.vec3f(0.94, 0.92, 0.88),
+    d.vec3f(0.83, 0.58, 0.28),
+    std.smoothstep(0.66, 0.7, t),
+  );
+  // The band where the filter is glued on.
+  wrap = std.mix(wrap, d.vec3f(0.58, 0.38, 0.18), std.smoothstep(0.63, 0.65, t) * (1 - std.smoothstep(0.67, 0.69, t)));
+  // Char, right behind the coal.
+  wrap = std.mix(d.vec3f(0.13, 0.12, 0.11), wrap, std.smoothstep(0.05, 0.13, t));
+  // Rounded shading across the rod, so it reads as a rod and not a stripe.
+  const across = std.saturate(std.abs(local.y) / girth);
+  const shade = 0.72 + 0.28 * std.sqrt(std.max(1 - across * across, 0));
+  let out = std.mix(colour, wrap * shade, body * dim);
+
+  // The coal breathes: two sine rates that do not divide, like the lamp flicker.
+  const coalSpan = std.length(local);
+  const throb = 0.75 + 0.16 * std.sin(time * 9.3) + 0.09 * std.sin(time * 27.1 + 1.7);
+  const coal = std.exp(-(coalSpan * coalSpan) / (girth * girth * 2.2)) * throb;
+  out = out + d.vec3f(1, 0.3, 0.04) * (coal * 1.5 * dim) + d.vec3f(1, 0.8, 0.45) * (coal * coal * dim);
+  return out;
+};
+
+/**
+ * A torch: a leaning handle below the planted point, a dark wrapped head, and
+ * a tongue of fire standing on it. The flame is emission; the handle is a
+ * solid that ghosts like the spout when something stands nearer.
+ */
+const drawTorch = (colour: d.v3f, uv: d.v2f, at: d.v3f, time: number, dim: number) => {
+  'use gpu';
+  const reach = 0.3 + at.z * 0.6;
+  const stickLen = 0.1 * reach;
+  const stickGirth = 0.0065 * reach;
+  // Handle runs down-screen with a slight lean; x along the handle.
+  const local = spin(uv - at.xy, -(Math.PI / 2 - 0.1));
+  const stick = barMask(local, stickLen, stickGirth);
+  const head = barMask(local, stickLen * 0.26, stickGirth * 2.1);
+  const across = std.saturate(std.abs(local.y) / (stickGirth * 2.1));
+  const shade = 0.7 + 0.3 * std.sqrt(std.max(1 - across * across, 0));
+  const grain = d.vec3f(0.24, 0.16, 0.09) * (0.91 + 0.09 * std.sin(local.x * 500));
+  // The wrap: darker, with a diagonal binding line.
+  const bind = 0.78 + 0.22 * std.sin((local.x + local.y * 2) * 900);
+  let out = std.mix(colour, grain * shade, stick * dim);
+  out = std.mix(out, d.vec3f(0.16, 0.1, 0.05) * (bind * shade), head * dim);
+
+  // Two tongues, the inner one hotter and faster, standing on the head.
+  const q = d.vec2f((uv.x - at.x) / (0.024 * reach), (at.y - uv.y) / (0.085 * reach));
+  const seed = at.x * 43.7 + at.y * 17.3;
+  const heat = std.saturate(
+    flameTongue(q, time, seed) +
+      flameTongue(d.vec2f(q.x * 1.7, q.y * 1.45 - 0.05), time * 1.35, seed + 3.1) * 0.7,
+  );
+  out = std.mix(out, flameGlowColour(heat), std.saturate(heat * 1.15) * dim);
+  // A soft halo, so the fire bleeds a little light past its own edge.
+  const haloSpan = std.length(d.vec2f(q.x, (q.y - 0.4) * 0.7));
+  out = out + d.vec3f(1, 0.45, 0.1) * (std.exp(-haloSpan * haloSpan * 2.2) * 0.18 * dim);
+  return out;
+};
+
+/**
+ * A campfire: crossed logs on the ground, an ember bed pulsing between them,
+ * and a broad fire of three tongues out of phase, so the whole body rolls
+ * instead of waving one arm.
+ */
+const drawCampfire = (colour: d.v3f, uv: d.v2f, at: d.v3f, time: number, dim: number) => {
+  'use gpu';
+  const reach = 0.3 + at.z * 0.6;
+  const logLen = 0.11 * reach;
+  const logGirth = 0.009 * reach;
+  const bed = at.xy + d.vec2f(0, 0.02 * reach);
+  // Two logs crossed; each local frame starts at its own left end.
+  const localA = spin(uv - bed, -0.24) + d.vec2f(logLen * 0.5, 0);
+  const localB = spin(uv - bed, 0.31) + d.vec2f(logLen * 0.5, 0);
+  const logA = barMask(localA, logLen, logGirth);
+  const logB = barMask(localB, logLen, logGirth);
+
+  // The ember bed under the logs, breathing slower than any flame.
+  const emberSpan = std.length((uv - bed) / d.vec2f(1.6, 1));
+  const throb = 0.7 + 0.2 * std.sin(time * 5.7) + 0.1 * std.sin(time * 13.9 + 0.8);
+  const ember = std.exp(-(emberSpan * emberSpan) / (logGirth * logGirth * 30)) * throb;
+
+  // Bark, lit from within by its own fire - gently, or the logs read as
+  // striped candy rather than wood.
+  const barkA = d.vec3f(0.27, 0.17, 0.1) * (0.92 + 0.08 * std.sin(localA.x * 520)) * (0.75 + ember * 0.5);
+  const barkB = d.vec3f(0.2, 0.12, 0.07) * (0.92 + 0.08 * std.sin(localB.x * 640)) * (0.75 + ember * 0.5);
+  let out = std.mix(colour, barkB, logB * dim);
+  out = std.mix(out, barkA, logA * dim);
+  out = out + d.vec3f(1, 0.35, 0.06) * (ember * 0.7 * dim);
+
+  // One tall tongue and two short ones tucked close, so the fire reads as a
+  // single rolling body rather than a pair of horns.
+  const q = d.vec2f((uv.x - at.x) / (0.05 * reach), (at.y - uv.y) / (0.12 * reach));
+  const seed = at.x * 31.9 + at.y * 23.1;
+  const heat = std.saturate(
+    flameTongue(q, time, seed) +
+      flameTongue(d.vec2f((q.x + 0.4) * 1.5, q.y * 1.9), time * 1.2, seed + 2.4) * 0.7 +
+      flameTongue(d.vec2f((q.x - 0.38) * 1.6, q.y * 2.1 + 0.05), time * 0.9, seed + 5.2) * 0.7,
+  );
+  out = std.mix(out, flameGlowColour(heat), std.saturate(heat * 1.2) * dim);
+  const haloSpan = std.length(d.vec2f(q.x * 0.8, (q.y - 0.3) * 0.6));
+  out = out + d.vec3f(1, 0.4, 0.08) * (std.exp(-haloSpan * haloSpan * 1.8) * 0.22 * dim);
+  return out;
 };
 
 const splatLayout = tgpu.bindGroupLayout({
@@ -776,7 +950,9 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
   // even before its glow lands anywhere.
   for (const slot of std.range(8)) {
     const a = look.lightsA[slot];
-    if (a.w > 0.001) {
+    // The leading slots belong to planted props, which get a drawn body below
+    // instead of the generic orb.
+    if (a.w > 0.001 && slot >= look.propCount) {
       const orbAt = d.vec2f(a.x, a.y);
       const orbSpan = std.length(uv - orbAt);
       // Generous pre-test with the largest size an orb can reach, so the
@@ -810,6 +986,35 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
         colour = colour +
           b.xyz * (halo * 0.7 * strength) +
           std.mix(b.xyz, d.vec3f(1), 0.75) * (core * 1.25 * strength);
+      }
+    }
+  }
+
+  // Planted objects, drawn as the things they are. Each carries its own lamp
+  // in the slots the orb loop skips above, so the glow is already in the
+  // scene; this pass adds the body the glow comes from. Same occlusion rule
+  // as the orbs: something standing nearer ghosts the prop.
+  for (const slot of std.range(4)) {
+    const prop = look.props[slot];
+    if (prop.w > 0.5) {
+      const reach = 0.3 + prop.z * 0.6;
+      if (std.length(uv - prop.xy) < 0.2 * reach) {
+        // Explicit-level sample: this branch is per-pixel.
+        const liveHere = std.textureSampleLevel(
+          compositeLayout.$.scene, compositeLayout.$.linear, prop.xy, 0,
+        ).x * compositeLayout.$.field.depthScale;
+        let dim = d.f32(1);
+        if (liveHere > prop.z + 0.05) {
+          dim = 0.15;
+        }
+        const at = d.vec3f(prop.xyz);
+        if (prop.w < 1.5) {
+          colour = drawCigarette(colour, uv, at, look.time, dim);
+        } else if (prop.w < 2.5) {
+          colour = drawTorch(colour, uv, at, look.time, dim);
+        } else {
+          colour = drawCampfire(colour, uv, at, look.time, dim);
+        }
       }
     }
   }
@@ -902,6 +1107,8 @@ export interface LiquidLook {
   /** Planted lamps: xyz position + power, then rgb tint + size. */
   lightsA: readonly (readonly [number, number, number, number])[];
   lightsB: readonly (readonly [number, number, number, number])[];
+  /** Planted objects for the composite: xy, depth, kind (0 empty). */
+  props: readonly (readonly [number, number, number, number])[];
   /** Spout marker: image xy, depth z, and ring emphasis in w. */
   spout: readonly [number, number, number, number];
   lens: number;
@@ -936,6 +1143,7 @@ export const defaultLook: LiquidLook = {
   cupMouths: Array.from({ length: 3 }, () => [0, 0, 0, 0] as const),
   lightsA: Array.from({ length: 8 }, () => [0, 0, 0, 0] as const),
   lightsB: Array.from({ length: 8 }, () => [0, 0, 0, 0.1] as const),
+  props: Array.from({ length: 4 }, () => [0, 0, 0, 0] as const),
   spout: [0.5, 0.1, Z_MAX * 0.92, 0.5],
   lens: 1.15,
   reflection: 0.12,
@@ -989,6 +1197,8 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
   let look: LiquidLook = { ...defaultLook };
   /** Whether the water textures hold anything worth clearing. */
   let surfaceDirty = true;
+  /** Latest shader clock, patched each frame and echoed by full look writes. */
+  let timeNow = 0;
 
   const splatParams = root
     .createBuffer(SplatParams, {
@@ -1154,6 +1364,9 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
       torchAt: look.torchAt,
       lightsA: look.lightsA.map(four),
       lightsB: look.lightsB.map(four),
+      props: look.props.map(four),
+      propCount: look.props.filter((p) => p[3] > 0.5).length,
+      time: timeNow,
       spout: four(look.spout),
       glassesA: four(look.glassesA),
       glassesB: four(look.glassesB),
@@ -1247,6 +1460,10 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
     },
 
     encodeComposite(encoder, frame) {
+      // The flames and coals animate on this clock; a patch, not a full write,
+      // for the same reason as the lightning flash.
+      timeNow = performance.now() / 1000;
+      lookParams.patch({ time: timeNow });
       if (frame) {
         cameraParams.write({
           uvTransform: frame.uvTransform,

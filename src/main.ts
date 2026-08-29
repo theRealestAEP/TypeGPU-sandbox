@@ -75,22 +75,24 @@ const MEDIA = [
  * and a dim ember, a torch is a plume and a flame.
  */
 const PROP_KINDS = [
+  // `lift` raises the smoke source to the flame's tip: emitted at the planted
+  // point, the plume drew straight over the drawn fire and hid it.
   {
     id: 'cigarette',
     label: 'Cigarette',
-    smoke: { rate: 0.5, radius: 0.035, heat: 2.5 },
+    smoke: { rate: 0.5, radius: 0.035, heat: 2.5, lift: 0.012 },
     lamp: { power: 0.35, size: 0.05, tint: [1, 0.45, 0.18] as const, flicker: 0.25 },
   },
   {
     id: 'torch',
     label: 'Torch',
-    smoke: { rate: 1.4, radius: 0.075, heat: 6 },
+    smoke: { rate: 1.4, radius: 0.075, heat: 6, lift: 0.07 },
     lamp: { power: 2.4, size: 0.16, tint: [1, 0.58, 0.2] as const, flicker: 1 },
   },
   {
     id: 'campfire',
     label: 'Fire',
-    smoke: { rate: 2.2, radius: 0.12, heat: 7.5 },
+    smoke: { rate: 2.2, radius: 0.09, heat: 7.5, lift: 0.14 },
     lamp: { power: 3.4, size: 0.24, tint: [1, 0.5, 0.16] as const, flicker: 1 },
   },
 ] as const;
@@ -459,7 +461,13 @@ async function main(): Promise<void> {
   function pushProps(): void {
     smoke.tune({
       props: placedProps.map((prop) => ({
-        at: prop.at,
+        // The drawn flame scales with depth; its smoke has to start where the
+        // flame ends, or the plume paints over the fire.
+        at: [
+          prop.at[0],
+          prop.at[1] - prop.kind.smoke.lift * (0.3 + prop.at[2] * 0.6),
+          prop.at[2],
+        ],
         rate: prop.kind.smoke.rate,
         radius: prop.kind.smoke.radius,
         heat: prop.kind.smoke.heat,
@@ -468,6 +476,16 @@ async function main(): Promise<void> {
     if (placedProps.length > 0) {
       smokeAlive = true;
     }
+    // The composite draws each prop's body - rod, torch, logs and flame - so
+    // it needs the kind as well as the place.
+    renderer.look({
+      props: [0, 1, 2, 3].map((i): [number, number, number, number] => {
+        const prop = placedProps[i];
+        return prop
+          ? [prop.at[0], prop.at[1], prop.at[2], PROP_KINDS.indexOf(prop.kind) + 1]
+          : [0, 0, 0, 0];
+      }),
+    });
     pushLights();
   }
 
@@ -833,8 +851,10 @@ async function main(): Promise<void> {
     medium = next;
     document.body.dataset.tool = medium;
     hud.setToolFilter(medium);
-    // Adds or removes the cursor lamp as the light tool comes and goes.
+    // Adds or removes the cursor lamp as the light tool comes and goes, and
+    // the spout marker as the props tool does.
     pushLights();
+    syncSpout();
     applyFlow();
   }
 
@@ -914,19 +934,37 @@ async function main(): Promise<void> {
     }
   });
 
-  // The Objects dropdown: which prop a click plants.
-  const propPick = document.getElementById('propKind');
-  if (propPick instanceof HTMLSelectElement) {
+  // The Objects tool anchors the far end of the bar: it plants things rather
+  // than changing what the spout carries, so it stands apart from the media
+  // cluster it is built with. The button keeps its listeners across the move.
+  const propsButton = document.querySelector('#media button[data-id="props"]');
+  if (propsButton) {
+    document.querySelector('.bar')?.append(propsButton);
+  }
+
+  // The Objects selector: a panel in the right rail, one entry per kind, shown
+  // while the Objects tool is in hand. Each entry carries a small drawn swatch
+  // so the choice is a picture rather than a word in a dropdown.
+  const propPanel = document.getElementById('propPanel');
+  if (propPanel) {
+    const choices = new Map<string, HTMLButtonElement>();
     for (const kind of PROP_KINDS) {
-      const option = document.createElement('option');
-      option.value = kind.id;
-      option.textContent = kind.label;
-      propPick.append(option);
+      const choice = document.createElement('button');
+      choice.type = 'button';
+      choice.className = 'prop-choice';
+      choice.setAttribute('aria-pressed', String(kind === propKind));
+      const swatch = document.createElement('span');
+      swatch.className = `prop-swatch prop-swatch-${kind.id}`;
+      choice.append(swatch, kind.label);
+      choice.addEventListener('click', () => {
+        propKind = kind;
+        for (const [id, other] of choices) {
+          other.setAttribute('aria-pressed', String(id === kind.id));
+        }
+      });
+      propPanel.append(choice);
+      choices.set(kind.id, choice);
     }
-    propPick.value = propKind.id;
-    propPick.addEventListener('change', () => {
-      propKind = PROP_KINDS.find((kind) => kind.id === propPick.value) ?? PROP_KINDS[1];
-    });
   }
 
   const vesselHost = document.getElementById('vessels');
@@ -960,7 +998,10 @@ async function main(): Promise<void> {
   }
 
   function syncSpout(): void {
-    renderer.look({ spout: [spoutX, spoutY, spoutZ, pouringNow() ? 1 : 0.55] });
+    // The props tool plants at the click, and a pour marker at the same spot
+    // reads as part of the object - so it stands down while props are in hand.
+    const emphasis = medium === 'props' ? 0 : pouringNow() ? 1 : 0.55;
+    renderer.look({ spout: [spoutX, spoutY, spoutZ, emphasis] });
   }
 
   function moveSpout(clientX: number, clientY: number): void {

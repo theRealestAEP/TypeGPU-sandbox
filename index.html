@@ -358,19 +358,88 @@
       }
       #pour[aria-pressed="true"] kbd { color: rgba(7, 9, 11, .7); background: rgba(7, 9, 11, .14); }
 
-      /* Which object the Objects tool plants. Only there when it matters. */
-      #propKind {
-        display: none;
-        font: inherit;
-        font-size: .72rem;
-        color: var(--signal);
-        background: var(--signal-dim);
+      /* Objects anchors the far end of the bar, apart from the media cluster:
+         it plants things rather than changing what the spout carries. */
+      .bar > [data-id="props"] { margin-left: .7rem; }
+
+      /* ---------- objects selector ----------
+         Which object a click plants. A panel in the right rail, only while the
+         Objects tool is in hand; each entry carries a small drawn swatch so
+         the choice is a picture rather than a word in a dropdown. */
+      #propPanel { display: none; flex-direction: column; min-width: 9.5rem; }
+      body[data-tool="props"] #propPanel { display: flex; }
+      .prop-choice {
+        display: flex;
+        align-items: center;
+        gap: .55rem;
+        width: 100%;
+        text-align: left;
+        padding: .4rem .55rem;
         border: 0;
-        border-radius: 3px;
-        padding: .34rem .4rem;
-        cursor: pointer;
+        border-left: 2px solid transparent;
+        border-radius: 0;
       }
-      body[data-tool="props"] #propKind { display: inline-block; }
+      .prop-choice + .prop-choice { border-top: 1px solid rgba(255, 255, 255, .05); }
+      .prop-choice[aria-pressed="true"] {
+        color: var(--text);
+        border-left-color: var(--signal);
+        background: rgba(255, 255, 255, .05);
+      }
+      .prop-swatch {
+        position: relative;
+        flex: none;
+        width: 1.9rem;
+        height: 1.9rem;
+        border-radius: 2px;
+        background: #101418;
+        overflow: hidden;
+      }
+      .prop-swatch::before, .prop-swatch::after { content: ""; position: absolute; }
+      /* Cigarette: a leaning white rod, tan filter, and a hot tip. */
+      .prop-swatch-cigarette::before {
+        left: 14%; top: 46%;
+        width: 74%; height: 12%;
+        border-radius: 2px;
+        transform: rotate(24deg);
+        background: linear-gradient(90deg, #ff8a2a 0 9%, #3c3733 9% 16%, #f2efe8 16% 68%, #d09a52 68%);
+      }
+      .prop-swatch-cigarette::after {
+        left: 6%; top: 30%;
+        width: 24%; height: 24%;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(255, 122, 26, .95), transparent 70%);
+      }
+      /* Torch: a dark handle under a small flame. */
+      .prop-swatch-torch::before {
+        left: 50%; top: 10%;
+        width: 36%; height: 46%;
+        transform: translateX(-50%);
+        border-radius: 50% 50% 50% 50% / 62% 62% 38% 38%;
+        background: radial-gradient(ellipse at 50% 78%, #fff3c2 0 18%, #ffab33 42%, #e4571d 72%, transparent 80%);
+      }
+      .prop-swatch-torch::after {
+        left: 46%; top: 48%;
+        width: 9%; height: 42%;
+        transform: rotate(6deg);
+        border-radius: 2px;
+        background: linear-gradient(#2a1c10 0 28%, #4a3320 28%);
+      }
+      /* Fire: crossed logs with a broader flame standing on them. */
+      .prop-swatch-campfire::before {
+        left: 50%; top: 12%;
+        width: 52%; height: 52%;
+        transform: translateX(-50%);
+        border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+        background: radial-gradient(ellipse at 50% 82%, #fff3c2 0 16%, #ffab33 40%, #e4571d 70%, transparent 80%);
+      }
+      .prop-swatch-campfire::after {
+        left: 16%; top: 66%;
+        width: 66%; height: 11%;
+        border-radius: 3px;
+        background: #4a3320;
+        box-shadow: 0 5px 0 -2px #38260f;
+        transform: rotate(-8deg);
+      }
 
       /* ---------- fill: a level gauge against the plate ----------
          How full the scene is, is a level. Drawn as one - a column standing
@@ -755,13 +824,15 @@
 
     <nav class="rail rail-r">
       <div class="surface cluster" id="views"></div>
+      <div class="surface" id="propPanel">
+        <p class="eyebrow" style="padding:.55rem .6rem 0;margin-bottom:.2rem">Objects</p>
+      </div>
     </nav>
 
     <div class="bar glass">
       <button id="pour" aria-pressed="false">Hold <kbd>space</kbd></button>
       <button id="storm" aria-pressed="false">Storm <kbd>S</kbd></button>
       <div class="cluster" id="media" style="padding:0"></div>
-      <select id="propKind" aria-label="object to place"></select>
       <button id="drain">Reset <kbd>D</kbd></button>
       <button id="tuneToggle">Tune <kbd>T</kbd></button>
     </div>
