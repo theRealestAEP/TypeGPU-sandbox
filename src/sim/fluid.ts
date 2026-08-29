@@ -625,15 +625,21 @@ const predictKernel = tgpu.computeFn({
       // wind actually gets hold of.
       velocity = d.vec3f(params.wind, 0, -params.emitSpeed + params.wind * 0.35);
     } else {
+      // The batch tiles the stream. Each step the falling column vacates a
+      // slab exactly one step's travel tall, and the emit rate fills that
+      // slab at rest density - so new water materializes into empty space
+      // moving with the flow, and there is no overlap for the solver to
+      // blast apart. Spawning the whole batch at one height made every
+      // batch overlap the last four, and the pour popped and sprayed from
+      // the spout no matter how the nozzle was shaped.
       position =
         params.emitter +
-        d.vec3f(across, along, through) * params.emitSpread;
-      // A stream, not a spray. Two things make a pour cone: lateral launch
-      // velocity, and a nozzle narrower than the flow can physically fit
-      // through - cram this flow into a thin disc and pressure blasts it
-      // back out as a fan. So the nozzle is sized to the flow's equilibrium
-      // width and the water leaves it with almost no sideways motion at all.
-      velocity = d.vec3f(across * params.emitSpread * 0.2, params.emitSpeed, 0);
+        d.vec3f(
+          across * params.emitSpread,
+          along * params.emitSpeed * params.dt,
+          through * params.emitSpread,
+        );
+      velocity = d.vec3f(0, params.emitSpeed, 0);
     }
 
     // The pour lands on the world under the spout. Left at its raw depth, a
@@ -700,7 +706,11 @@ const predictKernel = tgpu.computeFn({
     }
     const under = surfaceAt(position.xy) + params.kernelRadius * 4;
     if (!overCup && position.z > under) {
-      position = d.vec3f(position.xy, under);
+      // Keep the batch's depth spread when aiming. Snapping every spawn to
+      // the same plane crushed the stream's cross-section from a disc to a
+      // line, and the doubled density popped particles sideways - the pour
+      // fanned from the spout however the nozzle was shaped.
+      position = d.vec3f(position.xy, under - (through + 0.5) * params.emitSpread);
     }
 
   }
@@ -1319,7 +1329,7 @@ export const defaultTuning: FluidTuning = {
   rainReach: 0,
   recycle: false,
   emitSpeed: 0.65,
-  emitSpread: 0.022,
+  emitSpread: 0.03,
   emitRate: 18,
   emitterX: 0.5,
   emitterY: 0.06,

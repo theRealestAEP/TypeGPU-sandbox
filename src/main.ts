@@ -1237,7 +1237,12 @@ async function main(): Promise<void> {
     document.body.dataset.scene = next;
     hud.setSceneFilter(next);
     // A webcam is near level; a photo or clip can be shot from anywhere.
-    field.tune({ maxPitch: next === 'camera' ? 18 : 85 });
+    // Five degrees, down from eighteen: a front camera is level - the user
+    // has said so every time it drifted - and a close-held glass plus the
+    // hand under it forms exactly the coherent up-image-leaning cluster that
+    // passes every statistical gate. The pin still overrides for the rare
+    // ceiling-mounted webcam.
+    field.tune({ maxPitch: next === 'camera' ? 5 : 85 });
     if (handToggle) {
       handToggle.hidden = next !== 'camera' && next !== 'clip';
     }
