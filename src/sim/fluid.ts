@@ -200,7 +200,14 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
       // BEHIND the cavity - and from there the water passed the glass and
       // drained without ever being seen: three quarters of the pour, gone.
       if (std.abs(resolved.z - plane) > params.kernelRadius * 2) {
-        const snapped = d.vec3f(resolved.xy, plane);
+        // Around the plane, never ONTO it. Snapping the whole band to one
+        // exact z crushed the stream's cross-section flat for the third time
+        // in this file's history (spawn batch, then the aim, now here), and
+        // the pressure bloom above the mouth was the umbrella the user kept
+        // seeing. A per-particle hash spreads the landings across a kernel's
+        // worth of depth.
+        const spreadZ = (randomUnit(index * 7) - 0.5) * params.kernelRadius * 3;
+        const snapped = d.vec3f(resolved.xy, plane + spreadZ);
         simLayout.$.boundary[index] = simLayout.$.boundary[index] + (snapped - resolved);
         resolved = d.vec3f(snapped);
       }
@@ -567,7 +574,12 @@ const predictKernel = tgpu.computeFn({
     const local = pid - params.liveBase;
     const fresh = local < params.emitRate ? d.u32(0) : params.emitRate;
     const rotated = (local + span - (params.emitCursor % span)) % span;
-    const ticket = std.min(fresh, rotated);
+    // One regime at a time. Both windows firing together doubled and more
+    // the emission budget - a third of the whole pool poured in 2.5 seconds
+    // and the over-dense spawn blasted apart as a jellyfish. While the
+    // suffix still grows, the fresh conveyor IS the spout; the rotation only
+    // takes over once the pool is fully woken.
+    const ticket = params.liveBase > 0 ? fresh : rotated;
     if (
       ticket < params.emitRate &&
       position.z < params.recycleBand &&
@@ -596,7 +608,12 @@ const predictKernel = tgpu.computeFn({
     const local = pid - params.liveBase;
     const fresh = local < params.emitRate ? d.u32(0) : params.emitRate;
     const rotated = (local + span - (params.emitCursor % span)) % span;
-    const ticket = std.min(fresh, rotated);
+    // One regime at a time. Both windows firing together doubled and more
+    // the emission budget - a third of the whole pool poured in 2.5 seconds
+    // and the over-dense spawn blasted apart as a jellyfish. While the
+    // suffix still grows, the fresh conveyor IS the spout; the rotation only
+    // takes over once the pool is fully woken.
+    const ticket = params.liveBase > 0 ? fresh : rotated;
     if (ticket >= params.emitRate) {
       const parked = d.vec3f(params.emitter.x, DORMANT_Y, params.emitter.z);
       simLayout.$.particles[pid] = Particle({
@@ -971,6 +988,17 @@ const finalizeKernel = tgpu.computeFn({
     // stream still decelerates against the hallucinated ledge and mushrooms.
     if (inSpan && position.y < cup.y + cupHeight * 0.25) {
       channel = true;
+      // Splash stays in the glass. Entry splash-back climbing out of the
+      // mouth spread into a parachute over the spout - physical, but scaled
+      // to a firehose. Above the mouth, upward motion dies fast and drift
+      // fades; falling water is untouched, so the stream itself is free.
+      if (position.y < cup.y && position.z < cupWall) {
+        let vy = velocity.y;
+        if (vy < 0) {
+          vy *= 0.5;
+        }
+        velocity = d.vec3f(velocity.x * 0.8, vy, velocity.z * 0.8);
+      }
     }
     if (
       inSpan &&
@@ -1483,6 +1511,21 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
     return Math.max(PARTICLE_COUNT - wokenWindow, 0);
   }
 
+  /**
+   * The nozzle sized to the flow. Each substep the stream vacates a slab
+   * (emitSpeed * dt) tall; the batch must fit it at rest spacing or the
+   * column is born overdense and pressure blooms it into an umbrella - at
+   * a fixed nozzle the pour was calm at one flow and a jellyfish at
+   * another. Radius = sqrt(rate * spacing^3 / (slab height * pi)).
+   */
+  function nozzleSpread(): number {
+    const spacing = KERNEL_RADIUS * 0.55;
+    const slab = Math.max(tuning.emitSpeed * FIXED_DT, 1e-5);
+    const rate = Math.max(Math.round(tuning.emitRate), 1);
+    const radius = Math.sqrt((rate * spacing ** 3) / (slab * Math.PI));
+    return Math.max(tuning.emitSpread, radius * 2);
+  }
+
   function writeParams(): void {
     params.write({
       liveBase: liveBase(),
@@ -1497,7 +1540,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
       cohesion: tuning.cohesion,
       viscosity: tuning.viscosity,
       emitSpeed: tuning.emitSpeed,
-      emitSpread: tuning.emitSpread,
+      emitSpread: nozzleSpread(),
       surfaceFriction: tuning.surfaceFriction,
       pushLimit: KERNEL_RADIUS * 0.3,
       surfaceShell: tuning.surfaceShell,
