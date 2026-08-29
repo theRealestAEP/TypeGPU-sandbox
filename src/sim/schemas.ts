@@ -108,7 +108,7 @@ function chooseParticles(fallback: number): number {
  * as lag - and every containment fix made it worse by keeping more particles
  * alive. 180,000 holds rate and still fills the tub; ?particles=N overrides.
  */
-export const PARTICLE_COUNT = chooseParticles(QUALITY === 'low' ? 40000 : 180000);
+export const PARTICLE_COUNT = chooseParticles(QUALITY === 'low' ? 40000 : 140000);
 
 /** Side length of the depth field, in texels. */
 export const FIELD_RES = QUALITY === 'low' ? 192 : 256;
@@ -233,6 +233,8 @@ export const SimParams = d.struct({
   cupCarves: d.vec4f,
   /** How many cup slots are live. Zero lets every cup loop skip outright. */
   cupCount: d.u32,
+  /** Per cup, how fast its box is moving (units per second; z, w unused). */
+  cupShifts: d.arrayOf(d.vec4f, 3),
 });
 
 export const FieldParams = d.struct({

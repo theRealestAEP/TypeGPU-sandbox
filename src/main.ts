@@ -323,7 +323,7 @@ async function main(): Promise<void> {
     throw new Error('This browser has no WebGPU. Try Chrome 113+, Edge, or Safari 18+.');
   }
 
-  const root = await tgpu.init({ device: { optionalFeatures: ['shader-f16'] } });
+  const root = await tgpu.init({ device: { optionalFeatures: ['shader-f16', 'timestamp-query'] } });
   const context = root.configureContext({ canvas, alphaMode: 'opaque' });
 
   const linear = root.createSampler({
@@ -575,6 +575,20 @@ async function main(): Promise<void> {
    */
   let inScene = 0;
   let lastWetAt = 0;
+
+  // GPU pass attribution, when the device allows timing. Slots: 0/1 depth
+  // pipeline (model, carve, field, probes), 2/3 solver. Read a few times a
+  // second; gpuMs holds the latest sample for perf() and the readout.
+  const canTime = root.enabledFeatures.has('timestamp-query');
+  const gpuQuery = canTime ? root.createQuerySet('timestamp', 4) : undefined;
+  const gpuMs = { depth: 0, sim: 0 };
+  let lastGpuReadAt = 0;
+  const depthTimestamps = gpuQuery
+    ? { querySet: gpuQuery, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 }
+    : undefined;
+  const simTimestamps = gpuQuery
+    ? { querySet: gpuQuery, beginningOfPassWriteIndex: 2, endOfPassWriteIndex: 3 }
+    : undefined;
   /** One census readback in flight at a time. */
   let censusPending = false;
   let lastCensusAt = 0;
@@ -874,7 +888,10 @@ async function main(): Promise<void> {
     const lean = gravityManual ? 'pinned' : 'measured';
     gravityNote.textContent =
       `down · ${gravityPitch.toFixed(0)}\u00b0 into scene · ${gravityRoll.toFixed(0)}\u00b0 roll · ${lean}` +
-      ` · ${frameMsEma.toFixed(1)}ms (peak ${frameMsPeak.toFixed(0)})`;
+      ` · ${frameMsEma.toFixed(1)}ms (peak ${frameMsPeak.toFixed(0)})` +
+      (gpuMs.depth + gpuMs.sim > 0
+        ? ` · gpu depth ${gpuMs.depth.toFixed(1)} sim ${gpuMs.sim.toFixed(1)}`
+        : '');
   }
 
   // Hand control: shown only where there is a hand to track, toggled by
@@ -1293,7 +1310,9 @@ async function main(): Promise<void> {
       if (lastDepthAt > 0) {
         obstacleDt = Math.min(Math.max((now - lastDepthAt) / 1000, 1 / 240), 1 / 10);
       }
-      const depthPass = encoder.beginComputePass();
+      const depthPass = encoder.beginComputePass(
+        depthTimestamps ? { timestampWrites: depthTimestamps } : undefined,
+      );
       source.encode(depthPass, cameraFrame);
       // Detected vessels get their interiors before anything downstream reads
       // the depth: from here on, the glass IS hollow.
@@ -1325,7 +1344,9 @@ async function main(): Promise<void> {
       lastWetAt = pouringNow() || inScene > 0 ? now : lastWetAt;
     }
     if (steps > 0 && hasWater) {
-      const simPass = encoder.beginComputePass();
+      const simPass = encoder.beginComputePass(
+        simTimestamps ? { timestampWrites: simTimestamps } : undefined,
+      );
       // Walk the collision surface to where it stands at this instant. Depth
       // lands at video rate; without this the wall jumps a whole frame of an
       // obstacle's motion at once and the solver shoves water out of it far
@@ -1348,7 +1369,11 @@ async function main(): Promise<void> {
         pouringNow() &&
         medium === 'water' &&
         !recycling &&
-        PARTICLE_COUNT - inScene < emitRate * MAX_STEPS_PER_FRAME
+        (PARTICLE_COUNT - inScene < emitRate * MAX_STEPS_PER_FRAME ||
+          // The solver's cost is proportional to alive water - measured 22ms
+          // of a 24ms frame at a 100k pool. When pacing slips, stop growing
+          // the pool and circulate instead: the machine sets its own budget.
+          (frameMsEma > 24 && inScene > 20000))
       ) {
         recycling = true;
         fluid.tune({ recycle: true });
@@ -1421,6 +1446,22 @@ async function main(): Promise<void> {
         })
         .finally(() => {
           gravityPending = false;
+        });
+    }
+
+    // Sample the GPU pass timings a few times a second. One readback covers
+    // both slots; skip while a previous map is in flight.
+    if (gpuQuery?.available && now - lastGpuReadAt > 500) {
+      lastGpuReadAt = now;
+      gpuQuery.resolve();
+      void gpuQuery
+        .read()
+        .then((stamps) => {
+          gpuMs.depth = Number(stamps[1] - stamps[0]) / 1e6;
+          gpuMs.sim = Number(stamps[3] - stamps[2]) / 1e6;
+        })
+        .catch(() => {
+          // Device teardown mid-read; expected.
         });
     }
 
@@ -1585,6 +1626,7 @@ async function main(): Promise<void> {
     carve: number;
   }[] = [];
   let surfaceShellNow = defaultTuning.surfaceShell;
+  let lastCupsAt = performance.now();
   function driveCups(): void {
     // Detected cups reach the renderer, and the auto-aim spawn does the rest:
     // pour over a held glass and the water spawns just in front of it. The
@@ -1685,12 +1727,26 @@ async function main(): Promise<void> {
       if (remembered) {
         y0 = remembered.box[1] + (y0 - remembered.box[1]) * 0.12;
       }
+      // The box's own velocity, so the solver can carry the water inside a
+      // moving glass. Eased boxes move smoothly; the remaining rate is real
+      // motion, clamped so one detection jump cannot fling the pool.
+      const dtCups = Math.max((performance.now() - lastCupsAt) / 1000, 1 / 240);
+      let shift: [number, number] = [0, 0];
+      if (remembered) {
+        const clampRate = (v: number) => Math.min(Math.max(v, -1.5), 1.5);
+        shift = [
+          clampRate(((vessel.x0 + vessel.x1) - (remembered.box[0] + remembered.box[2])) / 2 / dtCups),
+          clampRate(((y0 + vessel.y1) - (remembered.box[1] + remembered.box[3])) / 2 / dtCups),
+        ];
+      }
       return {
         box: [vessel.x0, y0, vessel.x1, vessel.y1] as const,
         front,
         carve: carveDepth(vessel.x1 - vessel.x0, surfaceShellNow),
+        shift,
       };
     });
+    lastCupsAt = performance.now();
     carver.set(cups);
     // The solver gets the same cups, for the near-wall containment.
     fluid.tune({ cups });
@@ -1902,7 +1958,7 @@ async function main(): Promise<void> {
       smokeGrid: () => smoke.readCells(),
       counters: () => ({ solverSteps, encodes }),
       cupState: () => latestCups,
-      perf: () => ({ frameMsEma, frameMsPeak, solverSteps, encodes }),
+      perf: () => ({ frameMsEma, frameMsPeak, gpuDepthMs: gpuMs.depth, gpuSimMs: gpuMs.sim, solverSteps, encodes }),
       probeCells: () => probeCells,
       gestureState: () => (gestures ? 'loaded' : gesturesLoading ? 'loading' : 'none'),
       tuneFluid: (next: Parameters<typeof fluid.tune>[0]) => fluid.tune(next),

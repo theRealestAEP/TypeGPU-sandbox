@@ -608,7 +608,12 @@ const predictKernel = tgpu.computeFn({
       position =
         params.emitter +
         d.vec3f(across, along, through) * params.emitSpread;
-      velocity = d.vec3f(across * 3 * params.emitSpread, params.emitSpeed, through * 3 * params.emitSpread);
+      // A stream, not a spray. Two things make a pour cone: lateral launch
+      // velocity, and a nozzle narrower than the flow can physically fit
+      // through - cram this flow into a thin disc and pressure blasts it
+      // back out as a fan. So the nozzle is sized to the flow's equilibrium
+      // width and the water leaves it with almost no sideways motion at all.
+      velocity = d.vec3f(across * params.emitSpread * 0.2, params.emitSpeed, 0);
     }
 
     // The pour lands on the world under the spout. Left at its raw depth, a
@@ -624,6 +629,28 @@ const predictKernel = tgpu.computeFn({
     // and snapping the stream onto it started every drop buried in the halo.
     // Channel water spawns at its raw near-camera depth, falls in clear air
     // in front of everything, and the mouth capture takes it from there.
+    // A moving glass carries its water. Without this the pool stayed put in
+    // world space while the box teleported around it, and every wall clamp
+    // fought every other - moving the cup visibly exploded it. The box's
+    // own frame-to-frame velocity advects everything inside.
+    for (const slot of std.range(3)) {
+      const cup = params.cups[slot];
+      if (cup.z <= cup.x) {
+        continue;
+      }
+      const shift = params.cupShifts[slot];
+      if (
+        std.abs(shift.x) + std.abs(shift.y) > 0.001 &&
+        position.x > cup.x &&
+        position.x < cup.z &&
+        position.y > cup.y &&
+        position.y < cup.w &&
+        position.z < params.cupFronts[slot] * params.depthScale
+      ) {
+        position = position + d.vec3f(shift.x, shift.y, 0) * params.dt;
+      }
+    }
+
     let overCup = false;
     for (const slot of std.range(3)) {
       const cup = params.cups[slot];
@@ -1243,6 +1270,8 @@ export interface FluidTuning {
     box: readonly [number, number, number, number];
     front: number;
     carve: number;
+    /** Box velocity in field units per second, from frame-to-frame motion. */
+    shift: readonly [number, number];
   }[];
 }
 
@@ -1263,8 +1292,8 @@ export const defaultTuning: FluidTuning = {
   spoutShare: 0,
   rainReach: 0,
   recycle: false,
-  emitSpeed: 0.5,
-  emitSpread: 0.025,
+  emitSpeed: 0.65,
+  emitSpread: 0.022,
   emitRate: 18,
   emitterX: 0.5,
   emitterY: 0.06,
@@ -1433,6 +1462,10 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
         return cup ? [cup.box[0], cup.box[1], cup.box[2], cup.box[3]] : [0, 0, 0, 0];
       }),
       cupCount: Math.min(tuning.cups.length, 3),
+      cupShifts: [0, 1, 2].map((i): [number, number, number, number] => {
+        const cup = tuning.cups[i];
+        return cup ? [cup.shift[0], cup.shift[1], 0, 0] : [0, 0, 0, 0];
+      }),
       cupFronts: [
         tuning.cups[0]?.front ?? 0,
         tuning.cups[1]?.front ?? 0,
