@@ -235,6 +235,15 @@ export const SimParams = d.struct({
   cupCount: d.u32,
   /** Per cup, how fast its box is moving (units per second; z, w unused). */
   cupShifts: d.arrayOf(d.vec4f, 3),
+  /**
+   * First particle index that can possibly be alive. Emission sweeps indices
+   * downward from the top of the array, so everything ever woken lives in a
+   * contiguous suffix - and every particle kernel can skip the prefix
+   * entirely. A 20-second pour touches 30k slots, not 140k.
+   */
+  liveBase: d.u32,
+  /** Rotating emission cursor within the woken suffix, advanced on the CPU. */
+  emitCursor: d.u32,
 });
 
 export const FieldParams = d.struct({

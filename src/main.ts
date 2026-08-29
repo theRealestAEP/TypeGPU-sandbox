@@ -1958,6 +1958,7 @@ async function main(): Promise<void> {
       smokeGrid: () => smoke.readCells(),
       counters: () => ({ solverSteps, encodes }),
       cupState: () => latestCups,
+      fluidWindow: () => fluid.window(),
       perf: () => ({ frameMsEma, frameMsPeak, gpuDepthMs: gpuMs.depth, gpuSimMs: gpuMs.sim, solverSteps, encodes }),
       probeCells: () => probeCells,
       gestureState: () => (gestures ? 'loaded' : gesturesLoading ? 'loading' : 'none'),

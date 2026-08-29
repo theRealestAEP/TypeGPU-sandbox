@@ -16,7 +16,6 @@ import {
   KERNEL_RADIUS,
   MAX_DEPTH_SCALE,
   PARTICLE_COUNT,
-  PARTICLE_WORKGROUPS,
   Particle,
   ParticleArray,
   REST_DENSITY,
@@ -542,14 +541,15 @@ const predictKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= PARTICLE_COUNT) {
+  const pid = gid.x + simLayout.$.params.liveBase;
+  if (pid >= PARTICLE_COUNT) {
     return;
   }
   const params = simLayout.$.params;
   // A fresh step owes no boundary repair yet.
-  simLayout.$.boundary[gid.x] = d.vec3f();
-  let position = d.vec3f(simLayout.$.particles[gid.x].pos);
-  let velocity = d.vec3f(simLayout.$.particles[gid.x].vel);
+  simLayout.$.boundary[pid] = d.vec3f();
+  let position = d.vec3f(simLayout.$.particles[pid].pos);
+  let velocity = d.vec3f(simLayout.$.particles[pid].vel);
 
 
   // At capacity, retire the deepest settled water so the spout never runs dry.
@@ -557,7 +557,17 @@ const predictKernel = tgpu.computeFn({
   // them is invisible, and the emit window rate-limits it to exactly the inflow
   // - the level holds while the water circulates.
   if (params.recycle !== 0) {
-    const ticket = (gid.x + params.frame * params.emitRate) % PARTICLE_COUNT;
+    // Two spawn windows, one per regime. While the suffix is still growing,
+    // the slots woken THIS step are the window - fresh parked particles,
+    // spawned the moment they join the dispatch. Once the whole pool is
+    // woken the suffix stops growing and the CPU cursor rotates the window
+    // through it instead. (Deriving the rotation from frame * rate cancelled
+    // against the suffix growth and froze eighteen slots forever - twice.)
+    const span = std.max(PARTICLE_COUNT - params.liveBase, 1);
+    const local = pid - params.liveBase;
+    const fresh = local < params.emitRate ? d.u32(0) : params.emitRate;
+    const rotated = (local + span - (params.emitCursor % span)) % span;
+    const ticket = std.min(fresh, rotated);
     if (
       ticket < params.emitRate &&
       position.z < params.recycleBand &&
@@ -576,19 +586,29 @@ const predictKernel = tgpu.computeFn({
     // Drained. A rotating window of indices is eligible each step, which is
     // what rate-limits the spout; without it every drained particle returns at
     // once and the pour piles up on itself.
-    const ticket = (gid.x + params.frame * params.emitRate) % PARTICLE_COUNT;
+    // Two spawn windows, one per regime. While the suffix is still growing,
+    // the slots woken THIS step are the window - fresh parked particles,
+    // spawned the moment they join the dispatch. Once the whole pool is
+    // woken the suffix stops growing and the CPU cursor rotates the window
+    // through it instead. (Deriving the rotation from frame * rate cancelled
+    // against the suffix growth and froze eighteen slots forever - twice.)
+    const span = std.max(PARTICLE_COUNT - params.liveBase, 1);
+    const local = pid - params.liveBase;
+    const fresh = local < params.emitRate ? d.u32(0) : params.emitRate;
+    const rotated = (local + span - (params.emitCursor % span)) % span;
+    const ticket = std.min(fresh, rotated);
     if (ticket >= params.emitRate) {
       const parked = d.vec3f(params.emitter.x, DORMANT_Y, params.emitter.z);
-      simLayout.$.particles[gid.x] = Particle({
+      simLayout.$.particles[pid] = Particle({
         pos: d.vec3f(parked),
         prev: d.vec3f(parked),
         vel: d.vec3f(),
       });
       return;
     }
-    const across = randomUnit(gid.x * 3 + params.frame) - 0.5;
-    const along = randomUnit(gid.x * 3 + 1 + params.frame);
-    const through = randomUnit(gid.x * 3 + 2 + params.frame) - 0.5;
+    const across = randomUnit(pid * 3 + params.frame) - 0.5;
+    const along = randomUnit(pid * 3 + 1 + params.frame);
+    const through = randomUnit(pid * 3 + 2 + params.frame) - 0.5;
 
     // A storm fills most of the window from the sky, but never all of it: what
     // is left is the spout, so the tap still works in the rain.
@@ -694,7 +714,7 @@ const predictKernel = tgpu.computeFn({
   // gravity is what the normal force exists to balance; the wall test in
   // resolveSurface is what stops the tangential part running the pool over the
   // near rim.
-  const calmHere = std.saturate(simLayout.$.deltas[gid.x].w);
+  const calmHere = std.saturate(simLayout.$.deltas[pid].w);
   velocity = velocity +
     simLayout.$.scene.down *
       (params.gravity * params.dt * (1 - CALM_GRAVITY_RELIEF * calmHere));
@@ -706,7 +726,7 @@ const predictKernel = tgpu.computeFn({
     velocity = velocity * (limit / reach);
   }
 
-  simLayout.$.particles[gid.x] = Particle({
+  simLayout.$.particles[pid] = Particle({
     pos: position + velocity * params.dt,
     prev: d.vec3f(position),
     vel: d.vec3f(velocity),
@@ -718,11 +738,12 @@ const densityKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= PARTICLE_COUNT || isDormant(gid.x)) {
+  const pid = gid.x + simLayout.$.params.liveBase;
+  if (pid >= PARTICLE_COUNT || isDormant(pid)) {
     return;
   }
   const params = simLayout.$.params;
-  const position = d.vec3f(simLayout.$.particles[gid.x].pos);
+  const position = d.vec3f(simLayout.$.particles[pid].pos);
   const radius = params.kernelRadius;
 
   let density = d.f32(0);
@@ -758,8 +779,8 @@ const densityKernel = tgpu.computeFn({
   // the surface sucks inward, overshoots, and the whole body heats up into a gas.
   const constraint = std.max(density / params.restDensity - 1, 0);
   const stiffness = gradientEnergy + std.dot(gradientSum, gradientSum) + params.relaxation;
-  simLayout.$.deltas[gid.x] = d.vec4f(
-    simLayout.$.deltas[gid.x].xyz,
+  simLayout.$.deltas[pid] = d.vec4f(
+    simLayout.$.deltas[pid].xyz,
     -constraint / stiffness,
   );
 });
@@ -769,12 +790,13 @@ const deltaKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= PARTICLE_COUNT || isDormant(gid.x)) {
+  const pid = gid.x + simLayout.$.params.liveBase;
+  if (pid >= PARTICLE_COUNT || isDormant(pid)) {
     return;
   }
   const params = simLayout.$.params;
-  const position = d.vec3f(simLayout.$.particles[gid.x].pos);
-  const lambda = simLayout.$.deltas[gid.x].w;
+  const position = d.vec3f(simLayout.$.particles[pid].pos);
+  const lambda = simLayout.$.deltas[pid].w;
   const radius = params.kernelRadius;
 
   let correction = d.vec3f();
@@ -805,9 +827,9 @@ const deltaKernel = tgpu.computeFn({
     }
   }
 
-  simLayout.$.deltas[gid.x] = d.vec4f(
+  simLayout.$.deltas[pid] = d.vec4f(
     correction / params.restDensity,
-    simLayout.$.deltas[gid.x].w,
+    simLayout.$.deltas[pid].w,
   );
 });
 
@@ -816,17 +838,18 @@ const applyKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= PARTICLE_COUNT || isDormant(gid.x)) {
+  const pid = gid.x + simLayout.$.params.liveBase;
+  if (pid >= PARTICLE_COUNT || isDormant(pid)) {
     return;
   }
-  const particle = simLayout.$.particles[gid.x];
-  simLayout.$.particles[gid.x] = Particle({
+  const particle = simLayout.$.particles[pid];
+  simLayout.$.particles[pid] = Particle({
     // Tested against where the step started, not against the last solver
     // iteration. The ballistic step in `predict` is not surface-resolved, so a
     // fast drop can already be through a rim by the time the solver first sees
     // it; `prev` is the last position known to be on the legal side of every
     // wall.
-    pos: resolveSurface(gid.x, particle.prev, particle.pos + simLayout.$.deltas[gid.x].xyz),
+    pos: resolveSurface(pid, particle.prev, particle.pos + simLayout.$.deltas[pid].xyz),
     prev: d.vec3f(particle.prev),
     vel: d.vec3f(particle.vel),
   });
@@ -843,7 +866,8 @@ const finalizeKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= PARTICLE_COUNT || isDormant(gid.x)) {
+  const pid = gid.x + simLayout.$.params.liveBase;
+  if (pid >= PARTICLE_COUNT || isDormant(pid)) {
     return;
   }
   // Every stage above this one already skips dormant particles, so reaching
@@ -851,7 +875,7 @@ const finalizeKernel = tgpu.computeFn({
   // a thread that is running anyway.
   std.atomicAdd(simLayout.$.population[0], 1);
   const params = simLayout.$.params;
-  const particle = simLayout.$.particles[gid.x];
+  const particle = simLayout.$.particles[pid];
   let position = d.vec3f(particle.pos);
 
   // The glass's near wall, restored. The carve digs a cavity by pushing the
@@ -892,7 +916,7 @@ const finalizeKernel = tgpu.computeFn({
       const held = d.vec3f(position.xy, wall - params.kernelRadius);
       const full = held - position;
       const kick = std.clamp(full, d.vec3f(-params.kernelRadius), d.vec3f(params.kernelRadius));
-      simLayout.$.boundary[gid.x] = simLayout.$.boundary[gid.x] + (full - kick);
+      simLayout.$.boundary[pid] = simLayout.$.boundary[pid] + (full - kick);
       position = d.vec3f(held);
     }
   }
@@ -902,7 +926,7 @@ const finalizeKernel = tgpu.computeFn({
   // Subtracting them here means those relocations never read back as kinetic
   // energy. Ordinary push-outs on stable texels are NOT in the buffer - their
   // read-back is how resting water tracks a surface that jitters under it.
-  let velocity = (position - particle.prev - simLayout.$.boundary[gid.x]) / params.dt;
+  let velocity = (position - particle.prev - simLayout.$.boundary[pid]) / params.dt;
 
   // A large solver correction reads back as a large velocity. Cap it at the same
   // step the predictor allows, so one bad frame cannot inject energy that takes
@@ -1020,7 +1044,7 @@ const finalizeKernel = tgpu.computeFn({
     velocity = velocity * std.mix(1, params.surfaceFriction, floorness);
   }
 
-  simLayout.$.particles[gid.x] = Particle({
+  simLayout.$.particles[pid] = Particle({
     pos: d.vec3f(position),
     prev: d.vec3f(particle.prev),
     vel: d.vec3f(velocity),
@@ -1073,12 +1097,13 @@ const viscosityKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= PARTICLE_COUNT || isDormant(gid.x)) {
+  const pid = gid.x + simLayout.$.params.liveBase;
+  if (pid >= PARTICLE_COUNT || isDormant(pid)) {
     return;
   }
   const params = simLayout.$.params;
-  const position = d.vec3f(simLayout.$.particles[gid.x].pos);
-  const velocity = d.vec3f(simLayout.$.particles[gid.x].vel);
+  const position = d.vec3f(simLayout.$.particles[pid].pos);
+  const velocity = d.vec3f(simLayout.$.particles[pid].vel);
   const radius = params.kernelRadius;
 
   let smoothed = d.vec3f();
@@ -1188,8 +1213,8 @@ const viscosityKernel = tgpu.computeFn({
     }
   }
   const instant = (1 - std.saturate(around / CALM_SPEED)) * support * levelness * restable;
-  const calm = std.mix(instant, simLayout.$.calms[gid.x], 0.65);
-  simLayout.$.calms[gid.x] = calm;
+  const calm = std.mix(instant, simLayout.$.calms[pid], 0.65);
+  simLayout.$.calms[pid] = calm;
   const coefficient = params.viscosity + calm * (CALM_VISCOSITY - params.viscosity);
 
   // The multiplier has done its job by now, so this pass owns the whole slot.
@@ -1197,7 +1222,7 @@ const viscosityKernel = tgpu.computeFn({
   // particle's own velocity, so the relax pass applies both in one add.
   // Calm rides in w so next substep's predict can read it - deltas are indexed
   // by particle id, which is stable across the grid's re-sorts.
-  simLayout.$.deltas[gid.x] = d.vec4f(
+  simLayout.$.deltas[pid] = d.vec4f(
     smoothed * (coefficient / params.restDensity) - velocity * (calm * calm * SLEEP_DAMP),
     calm,
   );
@@ -1208,14 +1233,15 @@ const relaxKernel = tgpu.computeFn({
   in: { gid: d.builtin.globalInvocationId },
 })(({ gid }) => {
   'use gpu';
-  if (gid.x >= PARTICLE_COUNT || isDormant(gid.x)) {
+  const pid = gid.x + simLayout.$.params.liveBase;
+  if (pid >= PARTICLE_COUNT || isDormant(pid)) {
     return;
   }
-  const particle = simLayout.$.particles[gid.x];
-  simLayout.$.particles[gid.x] = Particle({
+  const particle = simLayout.$.particles[pid];
+  simLayout.$.particles[pid] = Particle({
     pos: d.vec3f(particle.pos),
     prev: d.vec3f(particle.prev),
-    vel: particle.vel + simLayout.$.deltas[gid.x].xyz,
+    vel: particle.vel + simLayout.$.deltas[pid].xyz,
   });
 });
 
@@ -1309,6 +1335,8 @@ export interface Fluid {
   initAsync(): Promise<void>;
   encode(pass: TgpuComputePass): void;
   tune(next: Partial<FluidTuning>): void;
+  /** Dev probe: the woken-suffix bookkeeping. */
+  window(): { woken: number; base: number; rate: number };
   /** Uploads the flood's spill-level surface; see the calm gate that reads it. */
   setSpill(filled: Float32Array): void;
   /** Send every particle back to the dormant pool, emptying the scene. */
@@ -1429,8 +1457,26 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
     return cup ? cup.carve : 0;
   }
 
+  /**
+   * How many suffix slots have ever been woken. Emission sweeps downward from
+   * the top of the index range, so this bounds every alive particle; drain()
+   * resets it. Aligned down to a workgroup so the dispatch math stays clean.
+   */
+  let wokenWindow = 0;
+  let emitCursor = 0;
+
+  function liveBase(): number {
+    // Exact, not workgroup-aligned: slots must enter the dispatch the same
+    // step they are woken, or they slide past the fresh spawn window at the
+    // suffix edge and never live - alignment bursts cost 70% of the flow.
+    // The dispatch's own ceil() covers the ragged start.
+    return Math.max(PARTICLE_COUNT - wokenWindow, 0);
+  }
+
   function writeParams(): void {
     params.write({
+      liveBase: liveBase(),
+      emitCursor,
       gravity: tuning.gravity,
       emitter: emitterPosition(),
       dt: FIXED_DT,
@@ -1498,21 +1544,33 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
     encode(pass) {
       frame = (frame + 1) >>> 0;
       lastObstacleDt = Math.min(Math.max(inputs.obstacleDt(), 1 / 240), 1 / 10);
+      wokenWindow = Math.min(
+        wokenWindow + Math.max(0, Math.round(tuning.emitRate)),
+        PARTICLE_COUNT,
+      );
+      emitCursor = (emitCursor + Math.max(0, Math.round(tuning.emitRate))) >>> 0;
       writeParams();
+      // Only the woken suffix dispatches. The prefix has never held a live
+      // particle, and grinding it through nine kernels a substep was pure
+      // tax - a fresh pour touches a few thousand slots, not the whole pool.
+      const groups = Math.max(
+        Math.ceil((PARTICLE_COUNT - liveBase()) / WORKGROUP_SIZE),
+        1,
+      );
 
       censusReset.with(pass).with(bindGroup).dispatchWorkgroups(1);
-      predict.with(pass).with(bindGroup).dispatchWorkgroups(PARTICLE_WORKGROUPS);
+      predict.with(pass).with(bindGroup).dispatchWorkgroups(groups);
       grid.encode(pass);
 
       for (let iteration = 0; iteration < SOLVER_ITERATIONS; iteration++) {
-        density.with(pass).with(bindGroup).dispatchWorkgroups(PARTICLE_WORKGROUPS);
-        delta.with(pass).with(bindGroup).dispatchWorkgroups(PARTICLE_WORKGROUPS);
-        apply.with(pass).with(bindGroup).dispatchWorkgroups(PARTICLE_WORKGROUPS);
+        density.with(pass).with(bindGroup).dispatchWorkgroups(groups);
+        delta.with(pass).with(bindGroup).dispatchWorkgroups(groups);
+        apply.with(pass).with(bindGroup).dispatchWorkgroups(groups);
       }
 
-      finalize.with(pass).with(bindGroup).dispatchWorkgroups(PARTICLE_WORKGROUPS);
-      viscosity.with(pass).with(bindGroup).dispatchWorkgroups(PARTICLE_WORKGROUPS);
-      relax.with(pass).with(bindGroup).dispatchWorkgroups(PARTICLE_WORKGROUPS);
+      finalize.with(pass).with(bindGroup).dispatchWorkgroups(groups);
+      viscosity.with(pass).with(bindGroup).dispatchWorkgroups(groups);
+      relax.with(pass).with(bindGroup).dispatchWorkgroups(groups);
     },
 
     tune(next) {
@@ -1522,7 +1580,10 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
 
     drain() {
       particles.write(initialParticles(emitterPosition()));
+      wokenWindow = 0;
     },
+
+    window: () => ({ woken: wokenWindow, base: liveBase(), rate: tuning.emitRate }),
 
     setSpill(filled) {
       spill.write(filled);
