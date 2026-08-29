@@ -154,18 +154,6 @@ const SCENARIOS: readonly Scenario[] = [
     look: { caustics: 0.4, foam: 6, scatter: 0.1 },
   },
   {
-    id: 'downpour',
-    label: 'Downpour',
-    note: 'photo - rain and lightning',
-    scene: 'photo',
-    storm: true,
-    medium: 'water',
-    flow: 70,
-    smoke: 0,
-    spout: [0.5, 0.06],
-    look: { caustics: 1.2, foam: 12, scatter: 0.14 },
-  },
-  {
     id: 'steam',
     label: 'Stove and hood',
     note: 'photo - steam pools under the hood',
@@ -1632,6 +1620,7 @@ async function main(): Promise<void> {
   }[] = [];
   let surfaceShellNow = defaultTuning.surfaceShell;
   let lastCupsAt = performance.now();
+  let shiftEma: [number, number] = [0, 0];
   function driveCups(): void {
     // Detected cups reach the renderer, and the auto-aim spawn does the rest:
     // pour over a held glass and the water spawns just in front of it. The
@@ -1738,11 +1727,24 @@ async function main(): Promise<void> {
       const dtCups = Math.max((performance.now() - lastCupsAt) / 1000, 1 / 240);
       let shift: [number, number] = [0, 0];
       if (remembered) {
-        const clampRate = (v: number) => Math.min(Math.max(v, -1.5), 1.5);
+        // Deadband before dividing by frame time: the eased box wobbles a
+        // fraction of a texel every frame, and jitter over 8ms became +-1.5
+        // units/s of advection thrashing the pool against its own walls -
+        // "splashes from every wall" on a perfectly static photo. Real hand
+        // motion sustains past the deadband; noise does not.
+        const rate = (d: number) => {
+          if (Math.abs(d) < 0.0035) {
+            return 0;
+          }
+          return Math.min(Math.max(d / dtCups, -1.5), 1.5);
+        };
+        const dx = ((vessel.x0 + vessel.x1) - (remembered.box[0] + remembered.box[2])) / 2;
+        const dy = ((y0 + vessel.y1) - (remembered.box[1] + remembered.box[3])) / 2;
         shift = [
-          clampRate(((vessel.x0 + vessel.x1) - (remembered.box[0] + remembered.box[2])) / 2 / dtCups),
-          clampRate(((y0 + vessel.y1) - (remembered.box[1] + remembered.box[3])) / 2 / dtCups),
+          shiftEma[0] + (rate(dx) - shiftEma[0]) * 0.3,
+          shiftEma[1] + (rate(dy) - shiftEma[1]) * 0.3,
         ];
+        shiftEma = shift;
       }
       return {
         box: [vessel.x0, y0, vessel.x1, vessel.y1] as const,
