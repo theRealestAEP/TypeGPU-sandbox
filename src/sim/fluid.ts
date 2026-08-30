@@ -729,7 +729,10 @@ const predictKernel = tgpu.computeFn({
       // scenery once the nozzle grew with flow: at spread 0.06 over a wall
       // reading 0.03, spawns landed at the far plane and fell hidden behind
       // the whole scene while the remainder smeared down the wall.
-      position = d.vec3f(position.xy, under + (through + 0.5) * params.emitSpread);
+      // Centred on the plane: fully behind starved thin scenery (spawns at
+      // the far plane behind a wall), fully in front halved what a cup's
+      // mouth could catch. Half a nozzle either side keeps both.
+      position = d.vec3f(position.xy, under + through * params.emitSpread);
     }
 
   }
