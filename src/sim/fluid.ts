@@ -886,7 +886,11 @@ const applyKernel = tgpu.computeFn({
 /** Zeroes the census before the step that refills it. One thread is enough. */
 const censusResetKernel = tgpu.computeFn({ workgroupSize: [1] })(() => {
   'use gpu';
-  std.atomicStore(simLayout.$.population[0], 0);
+  // Slot 0 is the whole population; the rest are water-through-flame counts,
+  // one per prop.
+  for (const slot of std.range(5)) {
+    std.atomicStore(simLayout.$.population[slot], 0);
+  }
 });
 
 const finalizeKernel = tgpu.computeFn({
@@ -905,6 +909,22 @@ const finalizeKernel = tgpu.computeFn({
   const params = simLayout.$.params;
   const particle = simLayout.$.particles[pid];
   let position = d.vec3f(particle.pos);
+
+  // Water through a flame, counted per prop. The region is the drawn flame's
+  // own image footprint - a half-width either side of the plant point and its
+  // height above it. Deliberately no depth test: emitted water snaps to the
+  // scene surface under the spout, so its z tracks the photo while the prop
+  // keeps its placement depth, and any honest z comparison never matches.
+  // What the eye sees - water falling through the flame - is the rule.
+  for (const slot of std.range(4)) {
+    const prop = params.props[slot];
+    if (prop.w > 0) {
+      const above = prop.y - position.y;
+      if (std.abs(position.x - prop.x) < prop.w && above > -prop.w && above < prop.w * 3) {
+        std.atomicAdd(simLayout.$.population[1 + slot], 1);
+      }
+    }
+  }
 
   // The glass's near wall, restored. The carve digs a cavity by pushing the
   // surface back, which also deletes the vessel's transparent front face - and
@@ -1338,6 +1358,8 @@ export interface FluidTuning {
     /** Box velocity in field units per second, from frame-to-frame motion. */
     shift: readonly [number, number];
   }[];
+  /** Burning props' flame regions: x, y, z, half-width. Doused slots absent. */
+  props: readonly (readonly [number, number, number, number])[];
 }
 
 export const defaultTuning: FluidTuning = {
@@ -1364,6 +1386,7 @@ export const defaultTuning: FluidTuning = {
   emitterY: 0.06,
   emitterZ: Z_MAX * 0.92,
   cups: [],
+  props: [],
 };
 
 export interface Fluid {
@@ -1437,7 +1460,7 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
   const particles = root.createBuffer(ParticleArray).$usage('storage', 'vertex');
   const deltas = root.createBuffer(d.arrayOf(d.vec4f, PARTICLE_COUNT)).$usage('storage');
   const params = root.createBuffer(SimParams).$usage('uniform');
-  const population = root.createBuffer(d.arrayOf(d.atomic(d.u32), 1)).$usage('storage');
+  const population = root.createBuffer(d.arrayOf(d.atomic(d.u32), 5)).$usage('storage');
   const calms = root.createBuffer(d.arrayOf(d.f32, PARTICLE_COUNT)).$usage('storage');
   const boundary = root.createBuffer(d.arrayOf(d.vec3f, PARTICLE_COUNT)).$usage('storage');
   const grid = createHashGrid(root, particles);
@@ -1580,6 +1603,10 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
         cupCarve(tuning.cups[2]),
         0,
       ],
+      props: [0, 1, 2, 3].map((i): [number, number, number, number] => {
+        const prop = tuning.props[i];
+        return prop ? [prop[0], prop[1], prop[2], prop[3]] : [0, 0, 0, 0];
+      }),
     });
   }
 

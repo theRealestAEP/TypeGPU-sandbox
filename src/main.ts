@@ -76,24 +76,29 @@ const MEDIA = [
  */
 const PROP_KINDS = [
   // `lift` raises the smoke source to the flame's tip: emitted at the planted
-  // point, the plume drew straight over the drawn fire and hid it.
+  // point, the plume drew straight over the drawn fire and hid it. `douse` is
+  // the flame's half-width - the region where falling water counts toward
+  // putting the fire out.
   {
     id: 'cigarette',
     label: 'Cigarette',
     smoke: { rate: 1.1, radius: 0.045, heat: 3.5, lift: 0.012 },
     lamp: { power: 0.35, size: 0.05, tint: [1, 0.45, 0.18] as const, flicker: 0.25 },
+    douse: 0.03,
   },
   {
     id: 'torch',
     label: 'Torch',
     smoke: { rate: 1.4, radius: 0.075, heat: 6, lift: 0.07 },
     lamp: { power: 2.4, size: 0.16, tint: [1, 0.58, 0.2] as const, flicker: 1 },
+    douse: 0.05,
   },
   {
     id: 'campfire',
     label: 'Fire',
     smoke: { rate: 2.2, radius: 0.09, heat: 7.5, lift: 0.14 },
     lamp: { power: 3.4, size: 0.24, tint: [1, 0.5, 0.16] as const, flicker: 1 },
+    douse: 0.08,
   },
 ] as const;
 type MediumId = (typeof MEDIA)[number]['id'];
@@ -455,23 +460,63 @@ async function main(): Promise<void> {
   const placedProps: {
     kind: (typeof PROP_KINDS)[number];
     at: [number, number, number];
+    /** How much of the fire is left: 1 burning, 0 out, animated between. */
+    fire: number;
+    /** Water seen in the flame lately; decays between census reads. */
+    wetness: number;
+    /** When the fire went out; 0 while it burns. */
+    dousedAt: number;
+    /** Whether the post-douse steam burst has already been shut off. */
+    vented: boolean;
   }[] = [];
   let propKind: (typeof PROP_KINDS)[number] = PROP_KINDS[1];
+  /** How long a doused prop vents steam before going quiet. */
+  const STEAM_MS = 1500;
+
+  function propFireRow(): [number, number, number, number] {
+    return [
+      placedProps[0]?.fire ?? 1,
+      placedProps[1]?.fire ?? 1,
+      placedProps[2]?.fire ?? 1,
+      placedProps[3]?.fire ?? 1,
+    ];
+  }
 
   function pushProps(): void {
+    const now = performance.now();
     smoke.tune({
-      props: placedProps.map((prop) => ({
+      props: placedProps.map((prop) => {
+        // A doused prop vents a burst of steam - white, hard, barely warm -
+        // then goes quiet for good.
+        const steaming = prop.dousedAt > 0 && now - prop.dousedAt < STEAM_MS;
         // The drawn flame scales with depth; its smoke has to start where the
         // flame ends, or the plume paints over the fire.
-        at: [
+        const at: [number, number, number] = [
           prop.at[0],
           prop.at[1] - prop.kind.smoke.lift * (0.3 + prop.at[2] * 0.6),
           prop.at[2],
-        ],
-        rate: prop.kind.smoke.rate,
-        radius: prop.kind.smoke.radius,
-        heat: prop.kind.smoke.heat,
-      })),
+        ];
+        return {
+          at,
+          rate: prop.dousedAt === 0
+            ? prop.kind.smoke.rate
+            : steaming
+              ? prop.kind.smoke.rate * 2.5
+              : 0,
+          radius: prop.kind.smoke.radius * (steaming ? 1.3 : 1),
+          heat: prop.dousedAt === 0 ? prop.kind.smoke.heat : 1,
+        };
+      }),
+    });
+    // The solver watches each burning flame's footprint for falling water; a
+    // doused prop stops watching.
+    fluid.tune({
+      props: [0, 1, 2, 3].map((i): [number, number, number, number] => {
+        const prop = placedProps[i];
+        return prop && prop.dousedAt === 0
+          ? [prop.at[0], prop.at[1], prop.at[2], prop.kind.douse]
+          : [0, 0, 0, 0];
+      }),
     });
     if (placedProps.length > 0) {
       smokeAlive = true;
@@ -491,16 +536,53 @@ async function main(): Promise<void> {
         ? [hoverX, hoverY, spoutZ, PROP_KINDS.indexOf(propKind) + 1]
         : [0, 0, 0, 0],
     );
-    renderer.look({ props: propRows });
+    renderer.look({ props: propRows, propFire: propFireRow() });
     pushLights();
   }
 
   function placeProp(): void {
     if (placedProps.length >= 4) {
-      placedProps.shift();
+      // A doused prop is spent, so it makes way before a burning one does.
+      const spent = placedProps.findIndex((prop) => prop.dousedAt > 0);
+      placedProps.splice(spent >= 0 ? spent : 0, 1);
     }
-    placedProps.push({ kind: propKind, at: [hoverX, hoverY, spoutZ] });
+    placedProps.push({
+      kind: propKind,
+      at: [hoverX, hoverY, spoutZ],
+      fire: 1,
+      wetness: 0,
+      dousedAt: 0,
+      vented: false,
+    });
     pushProps();
+  }
+
+  /**
+   * The gutter and the steam. A doused fire dies over a breath rather than a
+   * blink, and its steam burst shuts off once, when its time is up.
+   */
+  function driveProps(now: number): void {
+    let venting = false;
+    let guttering = false;
+    for (const prop of placedProps) {
+      if (prop.dousedAt === 0) {
+        continue;
+      }
+      const fire = Math.max(1 - (now - prop.dousedAt) / 400, 0);
+      if (fire !== prop.fire) {
+        prop.fire = fire;
+        guttering = true;
+      }
+      if (!prop.vented && now - prop.dousedAt >= STEAM_MS) {
+        prop.vented = true;
+        venting = true;
+      }
+    }
+    if (venting) {
+      pushProps();
+    } else if (guttering) {
+      renderer.look({ propFire: propFireRow() });
+    }
   }
 
   function lightTint(): [number, number, number] {
@@ -547,7 +629,8 @@ async function main(): Promise<void> {
     for (const prop of placedProps) {
       const f = prop.kind.lamp.flicker;
       const wave = 1 - f * 0.22 + f * (0.13 * Math.sin(now / 67) + 0.09 * Math.sin(now / 29 + 2.1));
-      a.push([prop.at[0], prop.at[1], prop.at[2], prop.kind.lamp.power * wave]);
+      // A doused fire lights nothing; the gutter dims the lamp with the flame.
+      a.push([prop.at[0], prop.at[1], prop.at[2], prop.kind.lamp.power * wave * prop.fire]);
       b.push([prop.kind.lamp.tint[0], prop.kind.lamp.tint[1], prop.kind.lamp.tint[2], prop.kind.lamp.size]);
     }
     for (let i = 0; i < 7 - placedProps.length; i++) {
@@ -1441,9 +1524,22 @@ async function main(): Promise<void> {
       lastCensusAt = now;
       void fluid.population
         .read()
-        .then(([count]) => {
+        .then(([count, ...flameHits]) => {
           inScene = count;
           hud.setFill(inScene / PARTICLE_COUNT);
+          // Water through a flame accumulates as wetness, which also decays:
+          // a stray droplet passes, a held pour crosses the threshold in a
+          // couple of reads and the fire goes out.
+          placedProps.forEach((prop, i) => {
+            if (prop.dousedAt > 0) {
+              return;
+            }
+            prop.wetness = prop.wetness * 0.6 + (flameHits[i] ?? 0);
+            if (prop.wetness > 25) {
+              prop.dousedAt = performance.now();
+              pushProps();
+            }
+          });
         })
         .catch(() => {
           // A read in flight when the device is torn down aborts; expected.
@@ -1517,6 +1613,7 @@ async function main(): Promise<void> {
     }
 
     driveTorch(now);
+    driveProps(now);
     driveTracking(now);
     driveCups();
 
@@ -2028,6 +2125,9 @@ async function main(): Promise<void> {
     // for driving the simulation from a headless check.
     Object.assign(globalThis, {
       probe: () => fluid.particles.read(),
+      census: () => fluid.population.read(),
+      propState: () =>
+        placedProps.map((p) => ({ wetness: p.wetness, dousedAt: p.dousedAt, fire: p.fire })),
       tracked: () => tracked,
       fakeVessel: (x0: number, y0: number, x1: number, y1: number) => {
         tracked = {

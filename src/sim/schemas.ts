@@ -236,6 +236,12 @@ export const SimParams = d.struct({
   /** Per cup, how fast its box is moving (units per second; z, w unused). */
   cupShifts: d.arrayOf(d.vec4f, 3),
   /**
+   * Burning props' flame regions: xy plant point, z depth, and the flame's
+   * half-width in w - zero for an empty or already-doused slot. The census
+   * counts water passing through each region, and the CPU douses on it.
+   */
+  props: d.arrayOf(d.vec4f, 4),
+  /**
    * First particle index that can possibly be alive. Emission sweeps indices
    * downward from the top of the array, so everything ever woken lives in a
    * contiguous suffix - and every particle kernel can skip the prefix

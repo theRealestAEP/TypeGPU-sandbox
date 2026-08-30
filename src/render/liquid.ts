@@ -141,6 +141,11 @@ const LookParams = d.struct({
   // tool is in hand - the object rides the pointer before it is planted.
   props: d.arrayOf(d.vec4f, 5),
   propCount: d.u32,
+  /**
+   * Per placed slot, how much of its fire is left: 1 burning, 0 doused, and
+   * the gutter animates between. The cursor preview always burns.
+   */
+  propFire: d.vec4f,
   /** Seconds, for the flames and coals that animate in the shader. */
   time: d.f32,
   /** The spout, drawn as a small lit sphere so its place in depth is legible. */
@@ -239,7 +244,14 @@ const flameGlowColour = (heat: number) => {
  * rises off it; the body runs down-right at an ashtray lean - charred paper
  * behind the coal, white paper, then the tan filter over the last third.
  */
-const drawCigarette = (colour: d.v3f, uv: d.v2f, at: d.v3f, time: number, dim: number) => {
+const drawCigarette = (
+  colour: d.v3f,
+  uv: d.v2f,
+  at: d.v3f,
+  time: number,
+  dim: number,
+  fire: number,
+) => {
   'use gpu';
   const reach = 0.3 + at.z * 0.6;
   const len = 0.085 * reach;
@@ -263,9 +275,11 @@ const drawCigarette = (colour: d.v3f, uv: d.v2f, at: d.v3f, time: number, dim: n
   const shade = 0.72 + 0.28 * std.sqrt(std.max(1 - across * across, 0));
   let out = std.mix(colour, wrap * shade, body * dim);
 
-  // The coal breathes: two sine rates that do not divide, like the lamp flicker.
+  // The coal breathes: two sine rates that do not divide, like the lamp
+  // flicker. Dousing kills the coal but leaves the rod - a wet cigarette is
+  // still a cigarette.
   const coalSpan = std.length(local);
-  const throb = 0.75 + 0.16 * std.sin(time * 9.3) + 0.09 * std.sin(time * 27.1 + 1.7);
+  const throb = (0.75 + 0.16 * std.sin(time * 9.3) + 0.09 * std.sin(time * 27.1 + 1.7)) * fire;
   const coal = std.exp(-(coalSpan * coalSpan) / (girth * girth * 2.2)) * throb;
   out = out + d.vec3f(1, 0.3, 0.04) * (coal * 1.5 * dim) + d.vec3f(1, 0.8, 0.45) * (coal * coal * dim);
   return out;
@@ -1076,13 +1090,19 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
         if (liveHere > prop.z + 0.05) {
           dim = 0.15;
         }
+        // Doused props keep their body but lose the fire; the preview in the
+        // fifth slot always burns.
+        let fire = d.f32(1);
+        if (slot < 4) {
+          fire = look.propFire[slot];
+        }
         const at = d.vec3f(prop.xyz);
         if (prop.w < 1.5) {
-          colour = drawCigarette(colour, uv, at, look.time, dim);
+          colour = drawCigarette(colour, uv, at, look.time, dim, fire);
         } else if (prop.w < 2.5) {
-          colour = drawTorchFire(colour, uv, at, look.time, dim);
+          colour = drawTorchFire(colour, uv, at, look.time, dim * fire);
         } else {
-          colour = drawCampfireFire(colour, uv, at, look.time, dim);
+          colour = drawCampfireFire(colour, uv, at, look.time, dim * fire);
         }
       }
     }
@@ -1178,6 +1198,8 @@ export interface LiquidLook {
   lightsB: readonly (readonly [number, number, number, number])[];
   /** Planted objects for the composite: xy, depth, kind (0 empty). */
   props: readonly (readonly [number, number, number, number])[];
+  /** Per placed slot, 1 burning to 0 doused. */
+  propFire: readonly [number, number, number, number];
   /** Spout marker: image xy, depth z, and ring emphasis in w. */
   spout: readonly [number, number, number, number];
   lens: number;
@@ -1215,6 +1237,7 @@ export const defaultLook: LiquidLook = {
   // Five, matching the schema: four placed slots plus the cursor preview. A
   // four-entry default made every full write fall back to the slow writer.
   props: Array.from({ length: 5 }, () => [0, 0, 0, 0] as const),
+  propFire: [1, 1, 1, 1],
   spout: [0.5, 0.1, Z_MAX * 0.92, 0.5],
   lens: 1.15,
   reflection: 0.12,
@@ -1494,6 +1517,7 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
       lightsA: look.lightsA.map(four),
       lightsB: look.lightsB.map(four),
       props: look.props.map(four),
+      propFire: four(look.propFire),
       // Only the four placed slots: the preview row is not a lamp, and
       // counting it skipped a real light's orb.
       propCount: look.props.slice(0, 4).filter((p) => p[3] > 0.5).length,
