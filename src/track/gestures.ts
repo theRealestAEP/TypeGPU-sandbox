@@ -31,7 +31,7 @@ const VESSEL_CLASSES = new Set(['cup', 'wine glass', 'bowl', 'vase']);
  * scene while the box it kept re-finding sat still.
  */
 const DETECT_HUNT_MS = 200;
-const DETECT_HOLD_MS = 500;
+const DETECT_HOLD_MS = 350;
 
 /** How the source frame maps into the field; mirrors the depth preprocessor. */
 export interface FrameFit {
@@ -132,7 +132,7 @@ export async function createGestures(needs: GestureNeeds): Promise<Gestures> {
   let lastVideoTime = -1;
   let lastDetectAt = -1e9;
   /** Candidates carry how long they have persisted and how long been missing. */
-  let candidates: (HeldVessel & { streak: number; misses: number })[] = [];
+  let candidates: (HeldVessel & { streak: number; misses: number; moving?: boolean })[] = [];
   let heldVessels: HeldVessel[] = [];
   let held: Tracked = { vessels: [], brow: [], eyes: [], lenses: [], effort: 0 };
 
@@ -176,7 +176,10 @@ export async function createGestures(needs: GestureNeeds): Promise<Gestures> {
     fit: FrameFit,
     now: number,
   ): void {
-    const cadence = heldVessels.length > 0 ? DETECT_HOLD_MS : DETECT_HUNT_MS;
+    // A moving vessel needs the hunt cadence: at the hold rate the box
+    // updates twice a second and tracking reads as molasses.
+    const anyMoving = candidates.some((candidate) => candidate.moving);
+    const cadence = heldVessels.length > 0 && !anyMoving ? DETECT_HOLD_MS : DETECT_HUNT_MS;
     if (now - lastDetectAt < cadence) {
       return;
     }
