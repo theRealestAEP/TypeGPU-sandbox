@@ -58,6 +58,10 @@ export interface HeldVessel {
 export interface Tracked {
   /** Cups, glasses and bowls the detector currently sees. */
   readonly vessels: HeldVessel[];
+  /** Increments each time the detector actually ran - the flow tracker in
+   * main.ts accumulates per-frame motion between rounds and resets on a new
+   * one, because a fresh detection already contains the motion. */
+  readonly round: number;
   /** Index fingertip, when a hand is in frame. */
   readonly tip?: TrackedPoint;
   /** Thumb tip, for the pinch gesture. */
@@ -131,10 +135,16 @@ export async function createGestures(needs: GestureNeeds): Promise<Gestures> {
 
   let lastVideoTime = -1;
   let lastDetectAt = -1e9;
+  let detectRound = 0;
   /** Candidates carry how long they have persisted and how long been missing. */
-  let candidates: (HeldVessel & { streak: number; misses: number; moving?: boolean })[] = [];
+  let candidates: (HeldVessel & {
+    streak: number;
+    misses: number;
+    moving?: boolean;
+    driftedOnce?: boolean;
+  })[] = [];
   let heldVessels: HeldVessel[] = [];
-  let held: Tracked = { vessels: [], brow: [], eyes: [], lenses: [], effort: 0 };
+  let held: Tracked = { vessels: [], round: 0, brow: [], eyes: [], lenses: [], effort: 0 };
 
   /** Source-frame normalised coords to field coords: the preprocessor, undone. */
   function toField(
@@ -184,6 +194,7 @@ export async function createGestures(needs: GestureNeeds): Promise<Gestures> {
       return;
     }
     lastDetectAt = now;
+    detectRound += 1;
     const found = finder.detectForVideo(source, now);
 
       const fresh: HeldVessel[] = [];
@@ -230,14 +241,24 @@ export async function createGestures(needs: GestureNeeds): Promise<Gestures> {
         if (index >= 0) {
           matched.add(index);
           const next = fresh[index];
-          // Asymmetric on purpose: growing edges follow the detection at
-          // full speed, shrinking edges crawl. A box that breathes sheds
-          // water - every upward jitter of the bottom edge strands the base
-          // layer outside the container for a frame, and on live footage
-          // that was a steady bottom leak. A held glass's true extent almost
-          // never shrinks quickly; jitter does.
+          // Stability at rest, speed in motion. Shrinking edges crawl so a
+          // breathing box cannot shed its base layer - but that crawl smears
+          // a MOVING glass seconds behind the hand. Whole-box translation is
+          // motion; jitter wobbles edges independently. Two consecutive
+          // drifting rounds (hysteresis - one round is detector noise, and
+          // acting on it shook the box and sprayed the pool) unlock
+          // symmetric fast easing.
+          const drift =
+            Math.abs(next.x0 + next.x1 - candidate.x0 - candidate.x1) / 2 +
+            Math.abs(next.y0 + next.y1 - candidate.y0 - candidate.y1) / 2;
+          const drifted = drift > 0.03;
+          candidate.moving = drifted && candidate.driftedOnce === true;
+          candidate.driftedOnce = drifted;
+          const moving = candidate.moving;
           const ease = (current: number, target: number, grow: boolean) =>
-            current + (target - current) * ((target > current) === grow ? 0.55 : 0.12);
+            current +
+            (target - current) *
+              (moving || (target > current) === grow ? 0.55 : 0.12);
           candidate.x0 = ease(candidate.x0, next.x0, false);
           candidate.y0 = ease(candidate.y0, next.y0, false);
           candidate.x1 = ease(candidate.x1, next.x1, true);
@@ -321,13 +342,13 @@ export async function createGestures(needs: GestureNeeds): Promise<Gestures> {
         }
       }
 
-      held = { vessels: heldVessels, tip, thumb, brow, eyes, lenses, effort };
+      held = { vessels: heldVessels, round: detectRound, tip, thumb, brow, eyes, lenses, effort };
       return held;
     },
 
     readStill(image, fit, now) {
       findVessels(image, image.width, image.height, fit, now);
-      held = { vessels: heldVessels, brow: [], eyes: [], lenses: [], effort: 0 };
+      held = { vessels: heldVessels, round: detectRound, brow: [], eyes: [], lenses: [], effort: 0 };
       return held;
     },
 

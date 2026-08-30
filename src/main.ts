@@ -403,7 +403,7 @@ async function main(): Promise<void> {
   /** Face and hand tracking, loaded the first time a video scene opens. */
   let gestures: Gestures | undefined;
   let gesturesLoading = false;
-  let tracked: Tracked = { vessels: [], brow: [], eyes: [], lenses: [], effort: 0 };
+  let tracked: Tracked = { vessels: [], round: 0, brow: [], eyes: [], lenses: [], effort: 0 };
   /** Fingertip control of the active tool; the toggle beside the readouts. */
   // Off by default: the hand landmarker costs GPU every frame whether or not
   // a hand is in view, and the fingertip cursor is a novelty. The chip turns
@@ -1767,6 +1767,86 @@ async function main(): Promise<void> {
    * of them running at once - and the auto-aim spawn clamp lands each drop ON
    * the face, so it rolls down the real geometry.
    */
+  /**
+   * Per-frame luma flow, the real-time half of cup tracking. The detector
+   * re-grounds the box a few times a second; this measures how the pixels
+   * under the box moved SINCE the last detector round, every frame, so the
+   * box (and the water it holds) rides the hand instead of easing after it.
+   * A 96x96 luma downsample and a +-3 texel SAD search - well under a
+   * millisecond, and +-3 texels a frame covers hands up to ~2 units/s.
+   */
+  const FLOW_RES = 96;
+  const flowCanvas = document.createElement('canvas');
+  flowCanvas.width = FLOW_RES;
+  flowCanvas.height = FLOW_RES;
+  const flowCtx = flowCanvas.getContext('2d', { willReadFrequently: true });
+  let flowPrev: Uint8ClampedArray | undefined;
+  let flowShift: [number, number] = [0, 0];
+  let flowRound = -1;
+
+  function driveFlow(): void {
+    if (!flowCtx || tracked.vessels.length === 0 || video.videoWidth === 0) {
+      flowPrev = undefined;
+      flowShift = [0, 0];
+      return;
+    }
+    if (tracked.round !== flowRound) {
+      // A fresh detection already contains the motion; start accumulating
+      // from zero against it.
+      flowRound = tracked.round;
+      flowShift = [0, 0];
+    }
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    const side = Math.min(w, h);
+    flowCtx.save();
+    if (sceneId === 'camera' && (mirrorOverride ?? camera.facing === 'user')) {
+      flowCtx.translate(FLOW_RES, 0);
+      flowCtx.scale(-1, 1);
+    }
+    flowCtx.drawImage(video, (w - side) / 2, (h - side) / 2, side, side, 0, 0, FLOW_RES, FLOW_RES);
+    flowCtx.restore();
+    const frame = flowCtx.getImageData(0, 0, FLOW_RES, FLOW_RES).data;
+    const prev = flowPrev;
+    flowPrev = frame.slice();
+    if (!prev) {
+      return;
+    }
+    const vessel = tracked.vessels[0];
+    const px0 = Math.min(Math.max(Math.round((vessel.x0 + flowShift[0]) * FLOW_RES) + 4, 4), FLOW_RES - 12);
+    const py0 = Math.min(Math.max(Math.round((vessel.y0 + flowShift[1]) * FLOW_RES) + 4, 4), FLOW_RES - 12);
+    const px1 = Math.min(Math.max(Math.round((vessel.x1 + flowShift[0]) * FLOW_RES) - 4, px0 + 6), FLOW_RES - 4);
+    const py1 = Math.min(Math.max(Math.round((vessel.y1 + flowShift[1]) * FLOW_RES) - 4, py0 + 6), FLOW_RES - 4);
+    const luma = (data: Uint8ClampedArray, x: number, y: number) => {
+      const at = (y * FLOW_RES + x) * 4;
+      return data[at] * 0.5 + data[at + 1] * 0.35 + data[at + 2] * 0.15;
+    };
+    let bestDx = 0;
+    let bestDy = 0;
+    let bestSad = Infinity;
+    for (let dy = -3; dy <= 3; dy++) {
+      for (let dx = -3; dx <= 3; dx++) {
+        let sad = 0;
+        for (let y = py0; y < py1; y += 2) {
+          for (let x = px0; x < px1; x += 2) {
+            sad += Math.abs(luma(frame, x + dx, y + dy) - luma(prev, x, y));
+          }
+        }
+        // A still bias: at equal error, prefer no motion.
+        sad *= 1 + (Math.abs(dx) + Math.abs(dy)) * 0.01;
+        if (sad < bestSad) {
+          bestSad = sad;
+          bestDx = dx;
+          bestDy = dy;
+        }
+      }
+    }
+    flowShift = [
+      flowShift[0] + bestDx / FLOW_RES,
+      flowShift[1] + bestDy / FLOW_RES,
+    ];
+  }
+
   /** Cups flow to the renderer and the carver whatever scene is up. */
   let latestCups: {
     box: readonly [number, number, number, number];
@@ -1785,8 +1865,11 @@ async function main(): Promise<void> {
     // boundary work in flight settles; until then the visual transparency and
     // the spawn aim are already live.
     const cupBoxes: [number, number, number, number][] = [];
-    for (const vessel of tracked.vessels.slice(0, 3)) {
-      cupBoxes.push([vessel.x0, vessel.y0, vessel.x1, vessel.y1]);
+    for (const [i, vessel] of tracked.vessels.slice(0, 3).entries()) {
+      // The outline rides the flow with the physics, or it lags the glass.
+      const fx = i === 0 ? flowShift[0] : 0;
+      const fy = i === 0 ? flowShift[1] : 0;
+      cupBoxes.push([vessel.x0 + fx, vessel.y0 + fy, vessel.x1 + fx, vessel.y1 + fy]);
     }
     while (cupBoxes.length < 3) {
       cupBoxes.push([0, 0, 0, 0]);
@@ -1816,7 +1899,18 @@ async function main(): Promise<void> {
     } else if (tracked.vessels.length > 0) {
       lastCupsSeenAt = performance.now();
     }
-    const cups = tracked.vessels.slice(0, 3).map((vessel) => {
+    const cups = tracked.vessels.slice(0, 3).map((raw, vesselIndex) => {
+      // The first vessel rides the per-frame flow between detector rounds.
+      const vessel =
+        vesselIndex === 0 && (Math.abs(flowShift[0]) + Math.abs(flowShift[1])) > 0
+          ? {
+              ...raw,
+              x0: raw.x0 + flowShift[0],
+              x1: raw.x1 + flowShift[0],
+              y0: raw.y0 + flowShift[1],
+              y1: raw.y1 + flowShift[1],
+            }
+          : raw;
       let front = 0.5;
       if (probeCells) {
         const at = (x: number, y: number) => {
@@ -1987,6 +2081,8 @@ async function main(): Promise<void> {
       return;
     }
     if (sceneId !== 'camera' && sceneId !== 'clip') {
+      flowPrev = undefined;
+      flowShift = [0, 0];
       if (fingerPour) {
         fingerPour = false;
         applyFlow();
@@ -2009,6 +2105,8 @@ async function main(): Promise<void> {
       },
       now,
     );
+
+    driveFlow();
 
     const tip = handControl ? tracked.tip : undefined;
     if (tip && !holding) {
@@ -2132,6 +2230,7 @@ async function main(): Promise<void> {
       fakeVessel: (x0: number, y0: number, x1: number, y1: number) => {
         tracked = {
           ...tracked,
+          round: tracked.round + 1,
           vessels: [{ x0, y0, x1, y1, label: 'cup' }],
         };
       },
