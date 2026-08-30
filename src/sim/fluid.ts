@@ -724,11 +724,12 @@ const predictKernel = tgpu.computeFn({
     }
     const under = surfaceAt(position.xy) + params.kernelRadius * 4;
     if (!overCup && position.z > under) {
-      // Keep the batch's depth spread when aiming. Snapping every spawn to
-      // the same plane crushed the stream's cross-section from a disc to a
-      // line, and the doubled density popped particles sideways - the pour
-      // fanned from the spout however the nozzle was shaped.
-      position = d.vec3f(position.xy, under - (through + 0.5) * params.emitSpread);
+      // Keep the batch's depth spread when aiming - IN FRONT of the plane.
+      // Spreading behind it put most of the batch inside or past thin
+      // scenery once the nozzle grew with flow: at spread 0.06 over a wall
+      // reading 0.03, spawns landed at the far plane and fell hidden behind
+      // the whole scene while the remainder smeared down the wall.
+      position = d.vec3f(position.xy, under + (through + 0.5) * params.emitSpread);
     }
 
   }

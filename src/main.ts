@@ -1418,6 +1418,16 @@ async function main(): Promise<void> {
       hud.setStatus('error', `Could not switch: ${reason}`);
     } finally {
       sceneLoading = false;
+      // The scene is only truly changed HERE, once the new depth can land -
+      // so this is where the old world gets forgotten. Draining at switch
+      // time wasn't enough: the relatched pour spent the load second pouring
+      // onto the outgoing scene's depth, and those piles then slept on ghost
+      // topology in the new room. Drain again, adopt the new scene as the
+      // background memory on its first update, and only then re-arm the pour.
+      fluid.drain();
+      model.resetTemporal();
+      field.snapBackground();
+      applyFlow();
     }
   }
 

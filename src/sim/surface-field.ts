@@ -438,6 +438,8 @@ export function downFromAngles(pitch: number, roll: number): [number, number, nu
 }
 
 export interface SurfaceField {
+  /** Adopt the live surface as the background at the next depth update. */
+  snapBackground(): void;
   /** Smoothed scene depth, 0 far and 1 near. */
   readonly surface: SingleChannelTexture;
   readonly params: TgpuBuffer<typeof FieldParams> & UniformFlag;
@@ -571,6 +573,15 @@ export function createSurfaceField(
     target: background.createView(d.textureStorage2d('rgba16float', 'write-only')),
   });
   const backPipe = root.createComputePipeline({ compute: backKernel });
+  // Scene changes snap the memory instead of easing it. The 3%-per-update
+  // adoption is right for a cup set down mid-scene, but after a scene SWITCH
+  // it left the physics half-believing the old room for ten seconds - fresh
+  // water collided with a kitchen that was no longer on screen.
+  let snapNext = false;
+  const backSnap = root.createBindGroup(holdLayout, {
+    source: surface.createView(),
+    target: background.createView(d.textureStorage2d('rgba16float', 'write-only')),
+  });
 
   /**
    * Walks the collision surface from the previous measurement to the newest one
@@ -630,11 +641,20 @@ export function createSurfaceField(
       walk.with(pass).with(walkBindGroup).dispatchWorkgroups(holdGroups, holdGroups);
     },
 
+    snapBackground() {
+      snapNext = true;
+    },
+
     encode(pass) {
       hold.with(pass).with(holdBindGroup).dispatchWorkgroups(holdGroups, holdGroups);
       filter.encode(pass);
-      backPipe.with(pass).with(backStep).dispatchWorkgroups(holdGroups, holdGroups);
-      hold.with(pass).with(backPublish).dispatchWorkgroups(holdGroups, holdGroups);
+      if (snapNext) {
+        snapNext = false;
+        hold.with(pass).with(backSnap).dispatchWorkgroups(holdGroups, holdGroups);
+      } else {
+        backPipe.with(pass).with(backStep).dispatchWorkgroups(holdGroups, holdGroups);
+        hold.with(pass).with(backPublish).dispatchWorkgroups(holdGroups, holdGroups);
+      }
       orient.with(pass).with(orientBindGroup).dispatchWorkgroups(1);
     },
 

@@ -135,6 +135,8 @@ const resampleKernel = tgpu.computeFn({
 export interface ModelDepthSource extends DepthSource {
   /** Download, compile and attach a bundle. Safe to call again to switch size. */
   load(size: ModelSize, signal: AbortSignal): Promise<void>;
+  /** Snap the temporal depth filter; call on scene changes. */
+  resetTemporal(): void;
   readonly ready: boolean;
 }
 
@@ -244,6 +246,14 @@ export function createModelDepth(root: TgpuRoot, depth: SingleChannelTexture): M
         throw error;
       }
       attach(next);
+    },
+
+    resetTemporal() {
+      // A scene change is not noise. The temporal filter's gentle-when-still
+      // easing treated a swapped photo as a wobbling scene and crossfaded the
+      // DEPTH over many seconds - water poured onto the old room's geometry
+      // long after the new room was on screen.
+      firstFrame = true;
     },
 
     encode(pass: TgpuComputePass, frame: CameraFrame | undefined) {
