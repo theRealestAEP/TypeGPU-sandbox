@@ -5,7 +5,10 @@ import type {
   TgpuRoot,
   TgpuSampler,
   UniformFlag,
+  VertexFlag,
 } from 'typegpu';
+import { loadPropModel } from './prop-models.ts';
+import type { PropModelSpec } from './prop-models.ts';
 import { createFieldTexture, createSeparableBlur, type SingleChannelTexture } from '../gpu/blur.ts';
 import { createSurfaceFilter } from '../gpu/surface-filter.ts';
 import type { CameraFrame } from '../depth/depth-field.ts';
@@ -269,35 +272,20 @@ const drawCigarette = (colour: d.v3f, uv: d.v2f, at: d.v3f, time: number, dim: n
 };
 
 /**
- * A torch: a leaning handle below the planted point, a dark wrapped head, and
- * a tongue of fire standing on it. The flame is emission; the handle is a
- * solid that ghosts like the spout when something stands nearer.
+ * The torch's fire: two layered tongues, the inner one hotter and faster,
+ * standing on the mesh handle the props pass drew. Emission only - the solid
+ * body is the model's.
  */
-const drawTorch = (colour: d.v3f, uv: d.v2f, at: d.v3f, time: number, dim: number) => {
+const drawTorchFire = (colour: d.v3f, uv: d.v2f, at: d.v3f, time: number, dim: number) => {
   'use gpu';
   const reach = 0.3 + at.z * 0.6;
-  const stickLen = 0.1 * reach;
-  const stickGirth = 0.0065 * reach;
-  // Handle runs down-screen with a slight lean; x along the handle.
-  const local = spin(uv - at.xy, -(Math.PI / 2 - 0.1));
-  const stick = barMask(local, stickLen, stickGirth);
-  const head = barMask(local, stickLen * 0.26, stickGirth * 2.1);
-  const across = std.saturate(std.abs(local.y) / (stickGirth * 2.1));
-  const shade = 0.7 + 0.3 * std.sqrt(std.max(1 - across * across, 0));
-  const grain = d.vec3f(0.24, 0.16, 0.09) * (0.91 + 0.09 * std.sin(local.x * 500));
-  // The wrap: darker, with a diagonal binding line.
-  const bind = 0.78 + 0.22 * std.sin((local.x + local.y * 2) * 900);
-  let out = std.mix(colour, grain * shade, stick * dim);
-  out = std.mix(out, d.vec3f(0.16, 0.1, 0.05) * (bind * shade), head * dim);
-
-  // Two tongues, the inner one hotter and faster, standing on the head.
   const q = d.vec2f((uv.x - at.x) / (0.024 * reach), (at.y - uv.y) / (0.085 * reach));
   const seed = at.x * 43.7 + at.y * 17.3;
   const heat = std.saturate(
     flameTongue(q, time, seed) +
       flameTongue(d.vec2f(q.x * 1.7, q.y * 1.45 - 0.05), time * 1.35, seed + 3.1) * 0.7,
   );
-  out = std.mix(out, flameGlowColour(heat), std.saturate(heat * 1.15) * dim);
+  let out = std.mix(colour, flameGlowColour(heat), std.saturate(heat * 1.15) * dim);
   // A soft halo, so the fire bleeds a little light past its own edge.
   const haloSpan = std.length(d.vec2f(q.x, (q.y - 0.4) * 0.7));
   out = out + d.vec3f(1, 0.45, 0.1) * (std.exp(-haloSpan * haloSpan * 2.2) * 0.18 * dim);
@@ -305,37 +293,20 @@ const drawTorch = (colour: d.v3f, uv: d.v2f, at: d.v3f, time: number, dim: numbe
 };
 
 /**
- * A campfire: crossed logs on the ground, an ember bed pulsing between them,
- * and a broad fire of three tongues out of phase, so the whole body rolls
- * instead of waving one arm.
+ * The campfire's fire: an ember bed pulsing in the mesh's log pile, and a
+ * broad body of three tongues out of phase - one tall, two short and tucked
+ * close, so it rolls instead of waving a pair of horns.
  */
-const drawCampfire = (colour: d.v3f, uv: d.v2f, at: d.v3f, time: number, dim: number) => {
+const drawCampfireFire = (colour: d.v3f, uv: d.v2f, at: d.v3f, time: number, dim: number) => {
   'use gpu';
   const reach = 0.3 + at.z * 0.6;
-  const logLen = 0.11 * reach;
-  const logGirth = 0.009 * reach;
-  const bed = at.xy + d.vec2f(0, 0.02 * reach);
-  // Two logs crossed; each local frame starts at its own left end.
-  const localA = spin(uv - bed, -0.24) + d.vec2f(logLen * 0.5, 0);
-  const localB = spin(uv - bed, 0.31) + d.vec2f(logLen * 0.5, 0);
-  const logA = barMask(localA, logLen, logGirth);
-  const logB = barMask(localB, logLen, logGirth);
-
-  // The ember bed under the logs, breathing slower than any flame.
+  const bed = at.xy + d.vec2f(0, 0.015 * reach);
   const emberSpan = std.length((uv - bed) / d.vec2f(1.6, 1));
   const throb = 0.7 + 0.2 * std.sin(time * 5.7) + 0.1 * std.sin(time * 13.9 + 0.8);
-  const ember = std.exp(-(emberSpan * emberSpan) / (logGirth * logGirth * 30)) * throb;
+  const emberSize = 0.009 * reach;
+  const ember = std.exp(-(emberSpan * emberSpan) / (emberSize * emberSize * 30)) * throb;
+  let out = colour + d.vec3f(1, 0.35, 0.06) * (ember * 0.7 * dim);
 
-  // Bark, lit from within by its own fire - gently, or the logs read as
-  // striped candy rather than wood.
-  const barkA = d.vec3f(0.27, 0.17, 0.1) * (0.92 + 0.08 * std.sin(localA.x * 520)) * (0.75 + ember * 0.5);
-  const barkB = d.vec3f(0.2, 0.12, 0.07) * (0.92 + 0.08 * std.sin(localB.x * 640)) * (0.75 + ember * 0.5);
-  let out = std.mix(colour, barkB, logB * dim);
-  out = std.mix(out, barkA, logA * dim);
-  out = out + d.vec3f(1, 0.35, 0.06) * (ember * 0.7 * dim);
-
-  // One tall tongue and two short ones tucked close, so the fire reads as a
-  // single rolling body rather than a pair of horns.
   const q = d.vec2f((uv.x - at.x) / (0.05 * reach), (at.y - uv.y) / (0.12 * reach));
   const seed = at.x * 31.9 + at.y * 23.1;
   const heat = std.saturate(
@@ -348,6 +319,93 @@ const drawCampfire = (colour: d.v3f, uv: d.v2f, at: d.v3f, time: number, dim: nu
   out = out + d.vec3f(1, 0.4, 0.08) * (std.exp(-haloSpan * haloSpan * 1.8) * 0.22 * dim);
   return out;
 };
+
+/** Prop mesh vertex data, baked from the GLB files at load. */
+const PropVertex = d.struct({ position: d.vec3f, normal: d.vec3f, tint: d.vec3f });
+const propVertexLayout = tgpu.vertexLayout(d.arrayOf(PropVertex));
+
+/** Which prop kind a mesh pipeline draws; comptime, one pipeline per kind. */
+const propKindSlot = tgpu.slot<number>();
+
+/** All of look.props, placed and preview alike, drawn as instances. */
+const PROP_SLOTS = 5;
+
+const meshLayout = tgpu.bindGroupLayout({
+  look: { uniform: LookParams },
+  field: { uniform: FieldParams },
+  scene: { texture: d.texture2d(d.f32) },
+  linear: { sampler: 'filtering' },
+});
+
+/**
+ * Props as meshes, orthographic in image space. Each pipeline is pinned to
+ * one kind; every slot of look.props is an instance, and a slot holding
+ * another kind - or nothing - collapses to a clipped point. The slow spin is
+ * what sells the volume: a static low-poly silhouette still reads as a
+ * sticker.
+ */
+const propMeshVertex = tgpu.vertexFn({
+  in: { position: d.vec3f, normal: d.vec3f, tint: d.vec3f, instance: d.builtin.instanceIndex },
+  out: { position: d.builtin.position, sNormal: d.vec3f, sTint: d.vec3f, fade: d.f32 },
+})(({ position, normal, tint, instance }) => {
+  'use gpu';
+  const prop = meshLayout.$.look.props[instance];
+  let clip = d.vec4f(0, 0, 2, 1);
+  let sNormal = d.vec3f(0, 0, 1);
+  let fade = d.f32(0);
+  if (std.abs(prop.w - propKindSlot.$) < 0.25) {
+    const reach = 0.3 + prop.z * 0.6;
+    // Ground props lean back further, so their tops - the ring of stones,
+    // the bed of logs - are actually visible from the camera's height.
+    const tilt = propKindSlot.$ === 2 ? 0.22 : 0.5;
+    const spin = meshLayout.$.look.time * 0.45 + d.f32(instance) * 1.3;
+    const cs = std.cos(spin);
+    const sn = std.sin(spin);
+    const spun = d.vec3f(position.x * cs + position.z * sn, position.y, position.z * cs - position.x * sn);
+    const nSpun = d.vec3f(normal.x * cs + normal.z * sn, normal.y, normal.z * cs - normal.x * sn);
+    const ct = std.cos(tilt);
+    const st = std.sin(tilt);
+    const leant = d.vec3f(spun.x, spun.y * ct - spun.z * st, spun.y * st + spun.z * ct);
+    const nLeant = d.vec3f(nSpun.x, nSpun.y * ct - nSpun.z * st, nSpun.y * st + nSpun.z * ct);
+    // Model space is y up; the image is y down.
+    const offset = d.vec3f(leant.x, -leant.y, leant.z) * reach;
+    const spot = prop.xy + offset.xy;
+    const nearness = prop.z + offset.z;
+    clip = d.vec4f(spot.x * 2 - 1, 1 - spot.y * 2, std.saturate(1 - nearness / d.f32(Z_MAX)), 1);
+    sNormal = d.vec3f(nLeant.x, -nLeant.y, nLeant.z);
+    // Same occlusion rule as the orbs, at the planted point. Explicit level:
+    // vertex shaders have no derivatives.
+    const liveHere = std.textureSampleLevel(
+      meshLayout.$.scene, meshLayout.$.linear, prop.xy, 0,
+    ).x * meshLayout.$.field.depthScale;
+    fade = d.f32(1);
+    if (liveHere > prop.z + 0.05) {
+      fade = 0.15;
+    }
+  }
+  return { position: d.vec4f(clip), sNormal: d.vec3f(sNormal), sTint: d.vec3f(tint), fade };
+});
+
+/**
+ * Flat-ish shading: the measured sun, a floor of ambient so the dark side
+ * never goes black over a photograph, and a warm underlight standing in for
+ * the prop's own fire. Premultiplied, so the composite lays it straight over.
+ */
+const propMeshFragment = tgpu.fragmentFn({
+  in: { sNormal: d.vec3f, sTint: d.vec3f, fade: d.f32 },
+  out: d.vec4f,
+})(({ sNormal, sTint, fade }) => {
+  'use gpu';
+  const n = std.normalize(sNormal);
+  const sunLit = std.saturate(std.dot(n, meshLayout.$.look.sun));
+  // The fire above is the nearest light, and it gleams off even near-black
+  // iron - so its term has an additive floor rather than scaling by the
+  // albedo alone, which left the torch a flat silhouette.
+  const fireLit = std.saturate(std.dot(n, std.normalize(d.vec3f(0, -0.85, 0.53))));
+  const lit = sTint * (0.45 + 0.55 * sunLit) +
+    (sTint + d.vec3f(0.22)) * (d.vec3f(1, 0.5, 0.2) * (fireLit * 0.55));
+  return d.vec4f(lit * fade, fade);
+});
 
 const splatLayout = tgpu.bindGroupLayout({
   splat: { uniform: SplatParams },
@@ -376,6 +434,8 @@ const compositeLayout = tgpu.bindGroupLayout({
   scene: { texture: d.texture2d(d.f32) },
   /** Ray-marched smoke, premultiplied colour in rgb and coverage in a. */
   smoke: { texture: d.texture2d(d.f32) },
+  /** The prop meshes, premultiplied and already depth-sorted among themselves. */
+  propsImg: { texture: d.texture2d(d.f32) },
   linear: { sampler: 'filtering' },
 });
 
@@ -992,10 +1052,14 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
     }
   }
 
-  // Planted objects, drawn as the things they are. Each carries its own lamp
-  // in the slots the orb loop skips above, so the glow is already in the
-  // scene; this pass adds the body the glow comes from. Same occlusion rule
-  // as the orbs: something standing nearer ghosts the prop.
+  // Planted objects. The solid bodies - torch handle, log pile - were drawn
+  // by the mesh pass into their own image, premultiplied and lit; here it
+  // lays straight over the scene. The cigarette keeps its drawn rod (no
+  // decent CC0 model exists at its scale), and every burning thing gets its
+  // live flame on top. Each prop also carries a lamp in the slots the orb
+  // loop skips above, so the glow is already in the room.
+  const solidProps = std.textureSample(compositeLayout.$.propsImg, compositeLayout.$.linear, uv);
+  colour = solidProps.rgb + colour * (1 - solidProps.a);
   for (const slot of std.range(5)) {
     const prop = look.props[slot];
     if (prop.w > 0.5) {
@@ -1013,9 +1077,9 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
         if (prop.w < 1.5) {
           colour = drawCigarette(colour, uv, at, look.time, dim);
         } else if (prop.w < 2.5) {
-          colour = drawTorch(colour, uv, at, look.time, dim);
+          colour = drawTorchFire(colour, uv, at, look.time, dim);
         } else {
-          colour = drawCampfire(colour, uv, at, look.time, dim);
+          colour = drawCampfireFire(colour, uv, at, look.time, dim);
         }
       }
     }
@@ -1145,7 +1209,9 @@ export const defaultLook: LiquidLook = {
   cupMouths: Array.from({ length: 3 }, () => [0, 0, 0, 0] as const),
   lightsA: Array.from({ length: 8 }, () => [0, 0, 0, 0] as const),
   lightsB: Array.from({ length: 8 }, () => [0, 0, 0, 0.1] as const),
-  props: Array.from({ length: 4 }, () => [0, 0, 0, 0] as const),
+  // Five, matching the schema: four placed slots plus the cursor preview. A
+  // four-entry default made every full write fall back to the slow writer.
+  props: Array.from({ length: 5 }, () => [0, 0, 0, 0] as const),
   spout: [0.5, 0.1, Z_MAX * 0.92, 0.5],
   lens: 1.15,
   reflection: 0.12,
@@ -1228,6 +1294,18 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
     .createTexture({ size: [SURFACE_RES, SURFACE_RES], format: 'depth24plus' })
     .$usage('render');
 
+  // The prop meshes get a sharper target than the fluid surface: hard
+  // polygon edges at the fluid's resolution smear into the canvas.
+  const PROPS_RES = 1024;
+  const propsImage = root
+    .createTexture({ size: [PROPS_RES, PROPS_RES], format: 'rgba16float' })
+    .$usage('sampled', 'render');
+  const propsDepth = root
+    .createTexture({ size: [PROPS_RES, PROPS_RES], format: 'depth24plus' })
+    .$usage('render');
+  const propsImageView = propsImage.createView('render');
+  const propsDepthView = propsDepth.createView('render');
+
   const rawDepthView = rawDepth.createView('render');
   const rawThicknessView = rawThickness.createView('render');
   const depthBufferView = depthBuffer.createView('render');
@@ -1248,6 +1326,7 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
     thickness: thickness.createView(),
     scene: inputs.scene.createView(),
     smoke: inputs.smoke.createView(),
+    propsImg: propsImage.createView(),
     linear: inputs.linear,
   });
 
@@ -1275,6 +1354,51 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
       },
     },
   });
+
+  const meshBindGroup = root.createBindGroup(meshLayout, {
+    look: lookParams,
+    field: inputs.fieldParams,
+    scene: inputs.scene.createView(),
+    linear: inputs.linear,
+  });
+
+  const meshPipeline = (kind: number) =>
+    root.with(propKindSlot, kind).createRenderPipeline({
+      attribs: { ...propVertexLayout.attrib },
+      vertex: propMeshVertex,
+      fragment: propMeshFragment,
+      targets: { format: 'rgba16float' },
+      depthStencil: {
+        format: 'depth24plus',
+        depthWriteEnabled: true,
+        depthCompare: 'less',
+      },
+    });
+  const torchMeshPipeline = meshPipeline(2);
+  const campfireMeshPipeline = meshPipeline(3);
+
+  /** A baked prop model on the GPU, ready to bind. */
+  interface PropMesh {
+    buffer: TgpuBuffer<ReturnType<typeof propVertexLayout.schemaForCount>> & VertexFlag;
+    count: number;
+  }
+  let torchMesh: PropMesh | undefined;
+  let campfireMesh: PropMesh | undefined;
+  /** Whether the props image holds anything worth clearing. */
+  let meshesShown = false;
+
+  async function bakeMesh(url: string, spec: PropModelSpec): Promise<PropMesh> {
+    const model = await loadPropModel(url, spec);
+    const buffer = root
+      .createBuffer(propVertexLayout.schemaForCount(model.vertexCount))
+      .$usage('vertex');
+    common.writeSoA(buffer, {
+      position: model.position,
+      normal: model.normal,
+      tint: model.tint,
+    });
+    return { buffer, count: model.vertexCount };
+  }
 
   const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
   const withCamera = root.with(cameraSlot, true).createRenderPipeline({
@@ -1391,6 +1515,17 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
 
   return {
     async initAsync() {
+      // The torch keeps only its handle - the model's baked fire cone is
+      // skipped, since the flame is drawn live. Anchors put the planted
+      // point where the fire sits: the top of the torch, just into the
+      // bonfire's log pile.
+      const meshes = Promise.all([
+        bakeMesh('/props/torch.glb', { skip: ['Fire'], fit: 'height', size: 0.13, anchor: 1 }),
+        bakeMesh('/props/campfire.glb', { fit: 'width', size: 0.15, anchor: 0.85 }),
+      ]).then(([torch, campfire]) => {
+        torchMesh = torch;
+        campfireMesh = campfire;
+      });
       await Promise.all([
         depthPipeline.initAsync(),
         thicknessPipeline.initAsync(),
@@ -1400,6 +1535,9 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
         temporal.initAsync(),
         publish.initAsync(),
         thicknessBlur.initAsync(),
+        torchMeshPipeline.initAsync(),
+        campfireMeshPipeline.initAsync(),
+        meshes,
       ]);
     },
 
@@ -1476,6 +1614,34 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
         });
       }
 
+      // Solid prop bodies first, depth-tested among themselves in their own
+      // image; the composite lays it over the scene and draws the flames on
+      // top. Cigarettes have no mesh, so a scene of only cigarettes skips
+      // the pass like an empty one - and one clearing pass is owed when the
+      // last mesh leaves.
+      const wantMeshes = look.props.some((prop) => prop[3] > 1.5);
+      if ((wantMeshes || meshesShown) && torchMesh && campfireMesh) {
+        const meshPass = encoder.beginRenderPass({
+          colorAttachments: { view: propsImageView, loadOp: 'clear', storeOp: 'store' },
+          depthStencilAttachment: {
+            view: propsDepthView,
+            depthClearValue: 1,
+            depthLoadOp: 'clear',
+            depthStoreOp: 'store',
+          },
+        });
+        if (wantMeshes) {
+          torchMeshPipeline.with(meshPass).with(meshBindGroup)
+            .with(propVertexLayout, torchMesh.buffer)
+            .draw(torchMesh.count, PROP_SLOTS);
+          campfireMeshPipeline.with(meshPass).with(meshBindGroup)
+            .with(propVertexLayout, campfireMesh.buffer)
+            .draw(campfireMesh.count, PROP_SLOTS);
+        }
+        meshPass.end();
+        meshesShown = wantMeshes;
+      }
+
       const pass = encoder.beginRenderPass({ colorAttachments: { view: inputs.context } });
       if (frame) {
         withCamera
@@ -1511,6 +1677,10 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
       history.destroy();
       thickHistory.destroy();
       depthBuffer.destroy();
+      propsImage.destroy();
+      propsDepth.destroy();
+      torchMesh?.buffer.destroy();
+      campfireMesh?.buffer.destroy();
     },
   };
 }

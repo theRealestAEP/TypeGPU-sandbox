@@ -43,3 +43,15 @@ Cropped square.
 city.webm: "square street traffic bird eye day light 01" by ShortsXpress,
 youtube.com/watch?v=zhM1pMML-2g, Creative Commons Attribution (CC-BY).
 Trimmed, cropped square, re-encoded.
+
+props/torch.glb: "Torch" by Quaternius (https://poly.pizza/u/Quaternius).
+CC0 1.0 - https://creativecommons.org/publicdomain/zero/1.0/
+Source: https://poly.pizza/m/Gq38E7hFZw
+Used unmodified; the baked fire cone in the model is skipped at load and the
+app draws its own animated flame instead.
+
+props/campfire.glb: "Bonfire" by Quaternius (https://poly.pizza/u/Quaternius).
+CC0 1.0 - https://creativecommons.org/publicdomain/zero/1.0/
+Source: https://poly.pizza/m/Azj9hJwwwG
+Used unmodified. Chosen over the fire-included variant because the stone ring
+and log pile carry the campfire silhouette, and the flame is drawn live.
