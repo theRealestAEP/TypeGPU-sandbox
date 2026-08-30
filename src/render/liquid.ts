@@ -358,7 +358,10 @@ const propMeshVertex = tgpu.vertexFn({
     // Ground props lean back further, so their tops - the ring of stones,
     // the bed of logs - are actually visible from the camera's height.
     const tilt = propKindSlot.$ === 2 ? 0.22 : 0.5;
-    const spin = meshLayout.$.look.time * 0.45 + d.f32(instance) * 1.3;
+    // A fixed three-quarter view per slot - the owner found the idle spin
+    // distracting. The per-slot phase keeps neighbouring props from posing
+    // identically.
+    const spin = d.f32(0.6) + d.f32(instance) * 1.3;
     const cs = std.cos(spin);
     const sn = std.sin(spin);
     const spun = d.vec3f(position.x * cs + position.z * sn, position.y, position.z * cs - position.x * sn);

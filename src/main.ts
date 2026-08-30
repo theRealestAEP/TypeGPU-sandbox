@@ -858,8 +858,11 @@ async function main(): Promise<void> {
     document.body.dataset.tool = medium;
     hud.setToolFilter(medium);
     // Adds or removes the cursor lamp as the light tool comes and goes, and
-    // the spout marker as the props tool does.
+    // the spout marker as the props tool does. pushProps clears the mesh
+    // preview the same way - without it, switching tools left the carried
+    // object hanging in the air where the cursor last was.
     pushLights();
+    pushProps();
     syncSpout();
     applyFlow();
   }
