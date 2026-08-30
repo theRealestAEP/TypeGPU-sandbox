@@ -217,8 +217,12 @@ export async function createGestures(needs: GestureNeeds): Promise<Gestures> {
         const index = fresh.findIndex(
           (next, i) =>
             !matched.has(i) &&
-            Math.abs(candidate.x0 - next.x0) < 0.15 &&
-            Math.abs(candidate.y0 - next.y0) < 0.15,
+            // Wide enough to follow a hand in motion: at 0.15 a moved
+            // glass failed to match its own track, the old one died of
+            // misses mid-motion, and the fresh one needed three rounds - a
+            // guaranteed gap that dumped the water.
+            Math.abs(candidate.x0 - next.x0) < 0.28 &&
+            Math.abs(candidate.y0 - next.y0) < 0.28,
         );
         if (index >= 0) {
           matched.add(index);

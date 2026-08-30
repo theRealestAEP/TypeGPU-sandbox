@@ -167,9 +167,10 @@ const resolveSurface = (index: number, from: d.v3f, position: d.v3f) => {
       continue;
     }
     const cupWidth = cup.z - cup.x;
-    const inSpan =
-      position.x > cup.x + cupWidth * d.f32(WALL) &&
-      position.x < cup.z - cupWidth * d.f32(WALL);
+    // Full box width, wall margins included: splash landing on the margin
+    // strips ran down the OUTSIDE of the glass and pooled around it. Above
+    // the mouth, everything over the box belongs to the cup.
+    const inSpan = position.x > cup.x && position.x < cup.z;
     // The pour channel: everything in a cup's column above or at its mouth
     // falls free of the scene. A close-held glass stands against a blank
     // wall, and a blank wall's depth is a hallucinated ledge - the stream

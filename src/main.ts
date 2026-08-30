@@ -80,7 +80,7 @@ const PROP_KINDS = [
   {
     id: 'cigarette',
     label: 'Cigarette',
-    smoke: { rate: 0.5, radius: 0.035, heat: 2.5, lift: 0.012 },
+    smoke: { rate: 1.1, radius: 0.045, heat: 3.5, lift: 0.012 },
     lamp: { power: 0.35, size: 0.05, tint: [1, 0.45, 0.18] as const, flicker: 0.25 },
   },
   {
@@ -478,14 +478,20 @@ async function main(): Promise<void> {
     }
     // The composite draws each prop's body - rod, torch, logs and flame - so
     // it needs the kind as well as the place.
-    renderer.look({
-      props: [0, 1, 2, 3].map((i): [number, number, number, number] => {
-        const prop = placedProps[i];
-        return prop
-          ? [prop.at[0], prop.at[1], prop.at[2], PROP_KINDS.indexOf(prop.kind) + 1]
-          : [0, 0, 0, 0];
-      }),
+    const propRows = [0, 1, 2, 3].map((i): [number, number, number, number] => {
+      const prop = placedProps[i];
+      return prop
+        ? [prop.at[0], prop.at[1], prop.at[2], PROP_KINDS.indexOf(prop.kind) + 1]
+        : [0, 0, 0, 0];
     });
+    // The fifth slot is the preview: with the Objects tool in hand, the
+    // chosen object rides the cursor so placing it is aiming, not guessing.
+    propRows.push(
+      medium === 'props'
+        ? [hoverX, hoverY, spoutZ, PROP_KINDS.indexOf(propKind) + 1]
+        : [0, 0, 0, 0],
+    );
+    renderer.look({ props: propRows });
     pushLights();
   }
 
@@ -1024,6 +1030,10 @@ async function main(): Promise<void> {
       renderer.look({ spout: [hoverX, hoverY, spoutZ, 0.8] });
       return;
     }
+    if (medium === 'props') {
+      pushProps();
+      return;
+    }
     syncSpout();
   }
 
@@ -1051,6 +1061,10 @@ async function main(): Promise<void> {
       // marker ball rides along so the glow has a visible source.
       pushLights();
       renderer.look({ spout: [hoverX, hoverY, spoutZ, 0.8] });
+    }
+    if (medium === 'props') {
+      // The chosen object rides the cursor the same way the lamp does.
+      pushProps();
     }
     if (holding) {
       moveSpout(event.clientX, event.clientY);
@@ -1660,8 +1674,10 @@ async function main(): Promise<void> {
     carve: number;
   }[] = [];
   let surfaceShellNow = defaultTuning.surfaceShell;
-  let lastCupsAt = performance.now();
+
   let shiftEma: [number, number] = [0, 0];
+  let carryAnchor = { x: 0, y: 0, t: 0 };
+  let lastCupsSeenAt = 0;
   function driveCups(): void {
     // Detected cups reach the renderer, and the auto-aim spawn does the rest:
     // pour over a held glass and the water spawns just in front of it. The
@@ -1689,6 +1705,17 @@ async function main(): Promise<void> {
     // finds the nearest real material - the hand holding the glass, the rim
     // highlights, whatever the model did register - and ignores the void by
     // construction. An eased hold on top, against per-frame depth noise.
+    // A briefly lost cup is still a cup. Detection drops out for a second
+    // or two exactly when the glass moves, and expiring the carve on the
+    // spot dumped the water every time - the vessel candidates upstream have
+    // their own grace, and this is the same idea one level down.
+    if (tracked.vessels.length === 0 && latestCups.length > 0) {
+      if (performance.now() - lastCupsSeenAt < 2500) {
+        return;
+      }
+    } else if (tracked.vessels.length > 0) {
+      lastCupsSeenAt = performance.now();
+    }
     const cups = tracked.vessels.slice(0, 3).map((vessel) => {
       let front = 0.5;
       if (probeCells) {
@@ -1765,27 +1792,33 @@ async function main(): Promise<void> {
       // The box's own velocity, so the solver can carry the water inside a
       // moving glass. Eased boxes move smoothly; the remaining rate is real
       // motion, clamped so one detection jump cannot fling the pool.
-      const dtCups = Math.max((performance.now() - lastCupsAt) / 1000, 1 / 240);
       let shift: [number, number] = [0, 0];
+      const cx = (vessel.x0 + vessel.x1) / 2;
+      const cy = (y0 + vessel.y1) / 2;
+      const nowMs = performance.now();
       if (remembered) {
-        // Deadband before dividing by frame time: the eased box wobbles a
-        // fraction of a texel every frame, and jitter over 8ms became +-1.5
-        // units/s of advection thrashing the pool against its own walls -
-        // "splashes from every wall" on a perfectly static photo. Real hand
-        // motion sustains past the deadband; noise does not.
-        const rate = (d: number) => {
-          if (Math.abs(d) < 0.0035) {
-            return 0;
-          }
-          return Math.min(Math.max(d / dtCups, -1.5), 1.5);
-        };
-        const dx = ((vessel.x0 + vessel.x1) - (remembered.box[0] + remembered.box[2])) / 2;
-        const dy = ((y0 + vessel.y1) - (remembered.box[1] + remembered.box[3])) / 2;
-        shift = [
-          shiftEma[0] + (rate(dx) - shiftEma[0]) * 0.3,
-          shiftEma[1] + (rate(dy) - shiftEma[1]) * 0.3,
-        ];
-        shiftEma = shift;
+        // Displacement measured against an anchor ~120ms back, not against
+        // last frame. The per-frame version had a deadband that jitter
+        // demanded, but any smooth slow hand motion also lives under a
+        // per-frame deadband - so real moves were never carried and only
+        // jerks were. Over 120ms, jitter averages to nothing while a slow
+        // 0.05-units/s drift accumulates well past the threshold.
+        const age = (nowMs - carryAnchor.t) / 1000;
+        if (age > 0.12) {
+          const dx = cx - carryAnchor.x;
+          const dy = cy - carryAnchor.y;
+          const rate = (d: number) =>
+            Math.abs(d) < 0.003 ? 0 : Math.min(Math.max(d / age, -1.5), 1.5);
+          shiftEma = [
+            shiftEma[0] + (rate(dx) - shiftEma[0]) * 0.5,
+            shiftEma[1] + (rate(dy) - shiftEma[1]) * 0.5,
+          ];
+          carryAnchor = { x: cx, y: cy, t: nowMs };
+        }
+        shift = shiftEma;
+      } else {
+        carryAnchor = { x: cx, y: cy, t: nowMs };
+        shiftEma = [0, 0];
       }
       return {
         box: [vessel.x0, y0, vessel.x1, vessel.y1] as const,
@@ -1794,7 +1827,6 @@ async function main(): Promise<void> {
         shift,
       };
     });
-    lastCupsAt = performance.now();
     carver.set(cups);
     // The solver gets the same cups, for the near-wall containment.
     fluid.tune({ cups });

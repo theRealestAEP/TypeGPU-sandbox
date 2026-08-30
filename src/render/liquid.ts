@@ -134,7 +134,9 @@ const LookParams = d.struct({
    * occupies one of the leading lamp slots for its glow; propCount says how
    * many, so the orb pass leaves those slots to the drawn bodies.
    */
-  props: d.arrayOf(d.vec4f, 4),
+  // Five slots: four placed props plus the cursor preview while the Objects
+  // tool is in hand - the object rides the pointer before it is planted.
+  props: d.arrayOf(d.vec4f, 5),
   propCount: d.u32,
   /** Seconds, for the flames and coals that animate in the shader. */
   time: d.f32,
@@ -994,7 +996,7 @@ const compositeFragment = tgpu.fragmentFn({ in: { uv: d.vec2f }, out: d.vec4f })
   // in the slots the orb loop skips above, so the glow is already in the
   // scene; this pass adds the body the glow comes from. Same occlusion rule
   // as the orbs: something standing nearer ghosts the prop.
-  for (const slot of std.range(4)) {
+  for (const slot of std.range(5)) {
     const prop = look.props[slot];
     if (prop.w > 0.5) {
       const reach = 0.3 + prop.z * 0.6;
@@ -1365,7 +1367,9 @@ export function createLiquidRenderer(root: TgpuRoot, inputs: LiquidInputs): Liqu
       lightsA: look.lightsA.map(four),
       lightsB: look.lightsB.map(four),
       props: look.props.map(four),
-      propCount: look.props.filter((p) => p[3] > 0.5).length,
+      // Only the four placed slots: the preview row is not a lamp, and
+      // counting it skipped a real light's orb.
+      propCount: look.props.slice(0, 4).filter((p) => p[3] > 0.5).length,
       time: timeNow,
       spout: four(look.spout),
       glassesA: four(look.glassesA),
