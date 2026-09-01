@@ -219,6 +219,12 @@ export const SimParams = d.struct({
   recycle: d.u32,
   /** How deep below the surface counts as settled, for recycling. */
   recycleBand: d.f32,
+  /** Palm centre in xy and swipe velocity in zw. */
+  hand: d.vec4f,
+  /** Radius of the palm's screen-space interaction region. */
+  handRadius: d.f32,
+  /** How strongly nearby water adopts the palm velocity. */
+  handPush: d.f32,
   frame: d.u32,
   /**
    * Detected drinking vessels, as field-space boxes; empty slots have x1 <= x0.

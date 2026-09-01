@@ -213,11 +213,9 @@ export function createModelDepth(root: TgpuRoot, depth: SingleChannelTexture): M
   }
 
   return {
-    // 150, from 100: each inference is the single biggest chunk on the
-    // frame it lands on, and the temporal surface walk was built to bridge
-    // exactly this gap. Stills run once regardless; this paces video and
-    // camera.
-    minIntervalMs: 150,
+    // Ten depth updates per second keeps live obstacles responsive while the
+    // temporal surface walk bridges the frames between them.
+    minIntervalMs: 100,
 
     get ready() {
       return plan !== undefined;

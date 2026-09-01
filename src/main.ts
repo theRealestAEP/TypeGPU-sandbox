@@ -237,6 +237,15 @@ const TUNE_GROUPS: readonly TuneGroup[] = [
     ],
   },
   {
+    title: 'live interaction',
+    scene: 'camera',
+    fields: [
+      { key: 'depthRate', label: 'depth refresh', min: 5, max: 15, step: 1, value: 10, format: (v) => `${v.toFixed(0)} fps` },
+      { key: 'handPush', label: 'hand push', min: 0, max: 1, step: 0.05, value: defaultTuning.handPush },
+      { key: 'handReach', label: 'hand reach', min: 0.5, max: 2, step: 0.05, value: defaultTuning.handReach },
+    ],
+  },
+  {
     title: 'pour',
     tool: 'water',
     fields: [
@@ -435,6 +444,7 @@ async function main(): Promise<void> {
   let lastDepthAt = 0;
   /** Seconds between the last two depth updates; drives obstacle-motion contact. */
   let obstacleDt = 1 / 30;
+  let depthRate = 10;
   /**
    * While a scene is loading, the video element and the depth texture still
    * hold the OLD scene, and every depth update the estimator ran against them
@@ -830,6 +840,10 @@ async function main(): Promise<void> {
         }
         if (key === 'surfaceShell') {
           surfaceShellNow = value;
+        }
+        if (key === 'depthRate') {
+          depthRate = value;
+          return;
         }
         if (key === 'depthScale') {
           depthScaleNow = value;
@@ -1450,7 +1464,8 @@ async function main(): Promise<void> {
     const source = activeSource();
     const encoder = root['~unstable'].createCommandEncoder();
 
-    if (!sceneLoading && now - lastDepthAt >= source.minIntervalMs) {
+    const depthInterval = source === model ? 1000 / depthRate : source.minIntervalMs;
+    if (!sceneLoading && now - lastDepthAt >= depthInterval) {
       if (lastDepthAt > 0) {
         obstacleDt = Math.min(Math.max((now - lastDepthAt) / 1000, 1 / 240), 1 / 10);
       }
@@ -2093,11 +2108,15 @@ async function main(): Promise<void> {
     if (sceneId !== 'camera' && sceneId !== 'clip') {
       flowPrev = undefined;
       flowShift = [0, 0];
+      fluid.tune({ hand: undefined });
       if (fingerPour) {
         fingerPour = false;
         applyFlow();
       }
       return;
+    }
+    if (!handControl) {
+      fluid.tune({ hand: undefined });
     }
     ensureGestures();
     if (!gestures) {
@@ -2115,6 +2134,18 @@ async function main(): Promise<void> {
       },
       now,
     );
+
+    fluid.tune({
+      hand: handControl && tracked.hand
+        ? {
+            x: tracked.hand.x,
+            y: tracked.hand.y,
+            vx: tracked.hand.vx,
+            vy: tracked.hand.vy,
+            radius: tracked.hand.radius,
+          }
+        : undefined,
+    });
 
     driveFlow();
 

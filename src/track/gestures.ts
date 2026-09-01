@@ -46,6 +46,14 @@ export interface TrackedPoint {
   readonly y: number;
 }
 
+export interface TrackedHand extends TrackedPoint {
+  /** Palm velocity in field units per second. */
+  readonly vx: number;
+  readonly vy: number;
+  /** Radius of the landmark footprint in field units. */
+  readonly radius: number;
+}
+
 export interface HeldVessel {
   /** Box in field coordinates. */
   x0: number;
@@ -66,6 +74,8 @@ export interface Tracked {
   readonly tip?: TrackedPoint;
   /** Thumb tip, for the pinch gesture. */
   readonly thumb?: TrackedPoint;
+  /** Palm footprint and motion, for direct fluid interaction. */
+  readonly hand?: TrackedHand;
   /** Sweat springs: high on the forehead and at the temples. */
   readonly brow: TrackedPoint[];
   /** Tear ducts: just under each eye. */
@@ -145,6 +155,7 @@ export async function createGestures(needs: GestureNeeds): Promise<Gestures> {
   })[] = [];
   let heldVessels: HeldVessel[] = [];
   let held: Tracked = { vessels: [], round: 0, brow: [], eyes: [], lenses: [], effort: 0 };
+  let lastHand: (TrackedPoint & { time: number }) | undefined;
 
   /** Source-frame normalised coords to field coords: the preprocessor, undone. */
   function toField(
@@ -308,10 +319,32 @@ export async function createGestures(needs: GestureNeeds): Promise<Gestures> {
       const map = (p: { x: number; y: number }) => toField(p, fit, w, h);
       let tip: TrackedPoint | undefined;
       let thumb: TrackedPoint | undefined;
+      let hand: TrackedHand | undefined;
       const palm = palms?.landmarks[0];
       if (palm) {
-        tip = map(palm[8]);
-        thumb = map(palm[4]);
+        const points = palm.map(map);
+        tip = points[8];
+        thumb = points[4];
+        const palmPoints = [points[0], points[5], points[9], points[13], points[17]];
+        const x = palmPoints.reduce((sum, point) => sum + point.x, 0) / palmPoints.length;
+        const y = palmPoints.reduce((sum, point) => sum + point.y, 0) / palmPoints.length;
+        const radius = Math.min(
+          Math.max(...points.map((point) => Math.hypot(point.x - x, point.y - y))),
+          0.22,
+        );
+        const dt = lastHand ? video.currentTime - lastHand.time : 0;
+        const vx = lastHand && dt > 0 && dt < 0.2 ? (x - lastHand.x) / dt : 0;
+        const vy = lastHand && dt > 0 && dt < 0.2 ? (y - lastHand.y) / dt : 0;
+        hand = {
+          x,
+          y,
+          vx,
+          vy,
+          radius,
+        };
+        lastHand = { x, y, time: video.currentTime };
+      } else {
+        lastHand = undefined;
       }
 
       const brow: TrackedPoint[] = [];
@@ -342,7 +375,7 @@ export async function createGestures(needs: GestureNeeds): Promise<Gestures> {
         }
       }
 
-      held = { vessels: heldVessels, round: detectRound, tip, thumb, brow, eyes, lenses, effort };
+      held = { vessels: heldVessels, round: detectRound, tip, thumb, hand, brow, eyes, lenses, effort };
       return held;
     },
 

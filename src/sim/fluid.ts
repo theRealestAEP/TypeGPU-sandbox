@@ -751,6 +751,18 @@ const predictKernel = tgpu.computeFn({
     simLayout.$.scene.down *
       (params.gravity * params.dt * (1 - CALM_GRAVITY_RELIEF * calmHere));
 
+  // Hand landmarks arrive at camera rate, independently of the slower depth
+  // field. A screen-space velocity transfer makes a swipe responsive even
+  // while the depth model is still reconstructing the hand as an obstacle.
+  const handSpeed = std.length(params.hand.zw);
+  const handDistance = std.distance(position.xy, params.hand.xy);
+  if (params.handRadius > 0 && handSpeed > 0.18 && handDistance < params.handRadius) {
+    const influence =
+      (1 - std.smoothstep(params.handRadius * 0.35, params.handRadius, handDistance)) *
+      params.handPush;
+    velocity = d.vec3f(std.mix(velocity.xy, params.hand.zw, std.saturate(influence)), velocity.z);
+  }
+
   // Never step further than a kernel radius, or neighbours are found too late.
   const reach = std.length(velocity) * params.dt;
   const limit = params.kernelRadius * 0.9;
@@ -1348,6 +1360,16 @@ export interface FluidTuning {
   rainReach: number;
   /** Recycle settled water so the pour has no ceiling. */
   recycle: boolean;
+  /** Direct screen-space interaction from the tracked palm. */
+  hand: {
+    x: number;
+    y: number;
+    vx: number;
+    vy: number;
+    radius: number;
+  } | undefined;
+  handPush: number;
+  handReach: number;
   emitSpeed: number;
   emitSpread: number;
   emitRate: number;
@@ -1383,6 +1405,9 @@ export const defaultTuning: FluidTuning = {
   spoutShare: 0,
   rainReach: 0,
   recycle: false,
+  hand: undefined,
+  handPush: 0.7,
+  handReach: 1,
   emitSpeed: 0.65,
   emitSpread: 0.03,
   emitRate: 18,
@@ -1583,6 +1608,11 @@ export function createFluid(root: TgpuRoot, inputs: FluidInputs): Fluid {
       rainReach: tuning.rainReach,
       recycle: tuning.recycle ? 1 : 0,
       recycleBand: KERNEL_RADIUS * 5,
+      hand: tuning.hand
+        ? [tuning.hand.x, tuning.hand.y, tuning.hand.vx, tuning.hand.vy]
+        : [0, 0, 0, 0],
+      handRadius: (tuning.hand?.radius ?? 0) * tuning.handReach,
+      handPush: tuning.handPush,
       frame,
       cups: [0, 1, 2].map((i): [number, number, number, number] => {
         const cup = tuning.cups[i];
