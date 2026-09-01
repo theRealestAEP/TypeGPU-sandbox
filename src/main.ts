@@ -240,7 +240,7 @@ const TUNE_GROUPS: readonly TuneGroup[] = [
     title: 'live interaction',
     scene: 'camera',
     fields: [
-      { key: 'depthRate', label: 'depth refresh', min: 5, max: 15, step: 1, value: 10, format: (v) => `${v.toFixed(0)} fps` },
+      { key: 'depthRate', label: 'depth refresh', min: 5, max: 60, step: 1, value: 10, format: (v) => `${v.toFixed(0)} fps` },
       { key: 'handPush', label: 'hand push', min: 0, max: 1, step: 0.05, value: defaultTuning.handPush },
       { key: 'handReach', label: 'hand reach', min: 0.5, max: 2, step: 0.05, value: defaultTuning.handReach },
     ],
